@@ -323,7 +323,6 @@ class PolygonSplitter:
         output_layer = QgsVectorLayer(f"Polygon?crs={crs}", "Split Parts", "memory")
         provider = output_layer.dataProvider()
         provider.addAttributes(layer.fields())
-        provider.addAttributes([QgsField("area", QVariant.Double)])
         output_layer.updateFields()
 
         project_unit = QgsProject.instance().areaUnits()
@@ -348,7 +347,6 @@ class PolygonSplitter:
                 converted_area = QgsUnitTypes.fromUnitToUnitFactor(crs_area_unit, project_unit) * area
             
             new_attributes = original_attributes.copy()
-            new_attributes.append(converted_area)
             feat.setAttributes(new_attributes)
             provider.addFeature(feat)
 
@@ -359,7 +357,7 @@ class PolygonSplitter:
         label_settings = QgsPalLayerSettings()
         label_settings.enabled = True
         label_settings.isExpression = True
-        label_settings.fieldName = f"concat(round(area, 2), ' {unit_abbrev}')"
+        label_settings.fieldName = f"concat(round($area, 2), ' {unit_abbrev}')"
         text_format = QgsTextFormat()
         text_format.setSize(15)
         text_format.setColor(Qt.red)
