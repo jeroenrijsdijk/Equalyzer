@@ -74,4 +74,4 @@ _"Finally, a splitting tool that thinks like a GIS professional!"_
 
 **Perfect for:**  Land management • Environmental monitoring • Urban planning • Agricultural zoning • Infrastructure development • Academic research
 
-_(yeah, this was written by DeepSeek, sorry :) )_
+_(yeah, this marketing-speak was written by DeepSeek, sorry :) )_
