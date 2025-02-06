@@ -88,8 +88,8 @@ class PolygonSplitter:
         self.iface = iface
         self.canvas = iface.mapCanvas()
         self.actions = []
-        self.menu = "&Polygon Splitter"
-        self.toolbar = self.iface.addToolBar("Polygon Splitter")
+        self.menu = "&Equalyzer"
+        self.toolbar = self.iface.addToolBar("Equalyzer")
         self.current_points = None
         self.clicked_point = None
 
@@ -183,25 +183,60 @@ class PolygonSplitter:
         if original_geom.isEmpty() or not original_geom.isGeosValid():
             raise Exception("Invalid geometry selected.")
 
-        original_area = original_geom.area()
-        
+        # Initialize distance area for accurate area measurement
+        da = QgsDistanceArea()
+        da.setEllipsoid(QgsProject.instance().ellipsoid())
+        da.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
+
+        # Calculate original area in the appropriate units (square meters or CRS units)
+        original_area_measured = da.measureArea(original_geom)
+
+        # Convert original area to project units for display
+        project_area_unit = QgsProject.instance().areaUnits()
+        if da.willUseEllipsoid():
+            original_area = QgsUnitTypes.fromUnitToUnitFactor(QgsUnitTypes.AreaSquareMeters, project_area_unit) * original_area_measured
+        else:
+            crs_distance_unit = layer.crs().mapUnits()
+            if crs_distance_unit == QgsUnitTypes.DistanceMeters:
+                crs_area_unit = QgsUnitTypes.AreaSquareMeters
+            elif crs_distance_unit == QgsUnitTypes.DistanceFeet:
+                crs_area_unit = QgsUnitTypes.AreaSquareFeet
+            else:
+                crs_area_unit = QgsUnitTypes.AreaSquareMeters
+            original_area = QgsUnitTypes.fromUnitToUnitFactor(crs_area_unit, project_area_unit) * original_area_measured
+
         if self.mode == "area":
-            expected_area, ok = QInputDialog.getDouble(
-                None, "Equal Area", "Enter target area per part:",
-                value=1000.0, min=0.1, max=original_area, decimals=1
+            # Get project unit abbreviation for display
+            project_unit = QgsProject.instance().areaUnits()
+            unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)  # e.g., "m²", "ha"
+
+            expected_area_input, ok = QInputDialog.getDouble(
+                None, 
+                "Equal Area", 
+                f"Enter target area per part ({unit_abbrev}):",  # Add unit to prompt
+                value=1000.0, 
+                min=0.1, 
+                max=original_area, 
+                decimals=1
             )
-            if not ok or expected_area <= 0:
+
+            if not ok or expected_area_input <= 0:
                 return
+            # Convert user input from project units to measurement units (square meters or CRS units)
+            if da.willUseEllipsoid():
+                expected_area = QgsUnitTypes.fromUnitToUnitFactor(project_area_unit, QgsUnitTypes.AreaSquareMeters) * expected_area_input
+            else:
+                expected_area = QgsUnitTypes.fromUnitToUnitFactor(project_area_unit, crs_area_unit) * expected_area_input
             num_parts = None
         else:
-            max_parts = min(1000, int(original_area / 0.1))
+            max_parts = min(1000, int(original_area_measured / 0.1))
             num_parts, ok = QInputDialog.getInt(
                 None, "Equal Parts", "Enter number of parts:",
                 value=2, min=2, max=max_parts
             )
             if not ok or num_parts < 1:
                 return
-            expected_area = original_area / num_parts
+            expected_area = original_area_measured / num_parts
 
         # Get direction line
         self.get_line_points()
@@ -240,11 +275,11 @@ class PolygonSplitter:
         angle_rad = math.atan2(dy, dx)
         angle_deg = -math.degrees(angle_rad)
 
-        # Splitting logic
+        # Splitting logic with correct area measurements
         def split_geometry(geom, angle_deg, center_point, target_area):
             parts = []
             remaining_geom = geom
-            total_area = remaining_geom.area()
+            total_area = da.measureArea(remaining_geom)
             while total_area >= target_area * 0.99:
                 rotated_geom = QgsGeometry(remaining_geom)
                 rotated_geom.rotate(-angle_deg, center_point)
@@ -257,7 +292,8 @@ class PolygonSplitter:
                     clip_rect = QgsRectangle(-1e6, -1e6, 1e6, mid)
                     clip_geom = QgsGeometry.fromRect(clip_rect)
                     temp_part = rotated_geom.intersection(clip_geom)
-                    if temp_part.area() < target_area:
+                    temp_area = da.measureArea(temp_part)
+                    if temp_area < target_area:
                         low = mid
                     else:
                         high = mid
@@ -266,12 +302,13 @@ class PolygonSplitter:
                 final_clip.rotate(angle_deg, center_point)
                 lower_part = remaining_geom.intersection(final_clip)
                 upper_part = remaining_geom.difference(final_clip)
-                if lower_part.isEmpty() or lower_part.area() < target_area * 0.95:
+                lower_area = da.measureArea(lower_part)
+                if lower_part.isEmpty() or lower_area < target_area * 0.95:
                     break
                 parts.append(lower_part)
                 remaining_geom = upper_part
-                total_area = remaining_geom.area()
-            if not remaining_geom.isEmpty() and remaining_geom.area() > 0.01:
+                total_area = da.measureArea(remaining_geom)
+            if not remaining_geom.isEmpty() and da.measureArea(remaining_geom) > 0.01:
                 parts.append(remaining_geom)
             return parts
 
@@ -281,7 +318,7 @@ class PolygonSplitter:
         except Exception as e:
             raise Exception(f"Splitting failed: {str(e)}")
 
-        # Create output layer
+        # Create output layer with corrected area calculation
         crs = layer.crs().authid()
         output_layer = QgsVectorLayer(f"Polygon?crs={crs}", "Split Parts", "memory")
         provider = output_layer.dataProvider()
@@ -289,9 +326,6 @@ class PolygonSplitter:
         provider.addAttributes([QgsField("area", QVariant.Double)])
         output_layer.updateFields()
 
-        da = QgsDistanceArea()
-        da.setEllipsoid(QgsProject.instance().ellipsoid())
-        da.setSourceCrs(output_layer.crs(), QgsProject.instance().transformContext())
         project_unit = QgsProject.instance().areaUnits()
         unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)
 
@@ -321,7 +355,7 @@ class PolygonSplitter:
         output_layer.updateExtents()
         QgsProject.instance().addMapLayer(output_layer)
 
-        # Configure labels
+        # Configure labels with correct area units
         label_settings = QgsPalLayerSettings()
         label_settings.enabled = True
         label_settings.isExpression = True
@@ -336,12 +370,17 @@ class PolygonSplitter:
 
         result_msg = f"Created {len(split_parts)} polygons\n"
         if self.mode == "area":
-            result_msg += f"Target area: {expected_area:.1f} {unit_abbrev}\n"
+            result_msg += f"Target area: {expected_area_input:.1f} {unit_abbrev}\n"
             if len(split_parts) > 1:
-                result_msg += f"Remainder area: {split_parts[-1].area():.1f} {unit_abbrev}"
+                remainder_area = QgsUnitTypes.fromUnitToUnitFactor(
+                    QgsUnitTypes.AreaSquareMeters if da.willUseEllipsoid() else crs_area_unit,
+                    project_unit
+                ) * da.measureArea(split_parts[-1])
+                result_msg += f"Remainder area: {remainder_area:.1f} {unit_abbrev}"
         else:
             result_msg += f"Requested parts: {num_parts}\n"
-            result_msg += f"Average area: {expected_area:.1f} {unit_abbrev}\n"
+            avg_area = original_area / num_parts
+            result_msg += f"Average area: {avg_area:.1f} {unit_abbrev}\n"
             if len(split_parts) != num_parts:
                 result_msg += f"Note: Split into {len(split_parts)} parts due to geometry constraints"
 
