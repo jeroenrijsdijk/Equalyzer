@@ -1,0 +1,32 @@
+[general]
+name=Equalyzer - Split Polygons into Equal Areas or Parts
+qgisMinimumVersion=3.16
+description=Splits polygons into equal areas or equal parts easily
+version=1.0
+author=Abel Koszeghy
+email=abelke@gmail.com
+
+about=Equalyzer - Split Polygons into Equal Areas or Parts
+
+homepage=https://github.com/danzig666/Equalyzer
+tracker=https://github.com/danzig666/Equalyzer/issues
+repository=https://github.com/danzig666/Equalyzer
+
+changelog = 1.0 Initial version
+
+hasProcessingProvider=no
+
+# Tags are comma separated with spaces allowed
+tags=python,split,polygon,divide
+
+icon=icon_area.png
+experimental=False
+
+deprecated=False
+
+Category of the plugin: Raster, Vector, Database or Web
+category=Vector
+
+# If the plugin can run on QGIS Server.
+server=False
+
