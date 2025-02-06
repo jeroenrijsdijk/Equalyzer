@@ -209,11 +209,15 @@ class PolygonSplitter:
             # Get project unit abbreviation for display
             project_unit = QgsProject.instance().areaUnits()
             unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)  # e.g., "m²", "ha"
+            prompt = (
+                f"Total area: {original_area:.2f} {unit_abbrev}\n"
+                f"Enter target area per part ({unit_abbrev}):"
+            )
 
             expected_area_input, ok = QInputDialog.getDouble(
                 None, 
                 "Equal Area", 
-                f"Enter target area per part ({unit_abbrev}):",  # Add unit to prompt
+                prompt,  # Now includes total area
                 value=1000.0, 
                 min=0.1, 
                 max=original_area, 
@@ -222,6 +226,22 @@ class PolygonSplitter:
 
             if not ok or expected_area_input <= 0:
                 return
+
+            # Calculate estimated parts before splitting
+            estimated_parts = math.ceil(original_area / expected_area_input)
+            
+            # Show confirmation if estimate exceeds 1000
+            if estimated_parts > 1000:
+                msg = QMessageBox(
+                    QMessageBox.Warning,
+                    "High Partition Count",
+                    f"Estimated {estimated_parts} parts. This may cause performance issues.\nProceed?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if msg.exec_() == QMessageBox.No:
+                    self.iface.messageBar().pushInfo("Cancelled", "Operation aborted by user")
+                    return
+
             # Convert user input from project units to measurement units (square meters or CRS units)
             if da.willUseEllipsoid():
                 expected_area = QgsUnitTypes.fromUnitToUnitFactor(project_area_unit, QgsUnitTypes.AreaSquareMeters) * expected_area_input
@@ -229,10 +249,22 @@ class PolygonSplitter:
                 expected_area = QgsUnitTypes.fromUnitToUnitFactor(project_area_unit, crs_area_unit) * expected_area_input
             num_parts = None
         else:
-            max_parts = min(1000, int(original_area_measured / 0.1))
+            # Calculate max parts based on project units
+            max_parts = max(2, min(1000, int(original_area / 0.1)))  # Ensures min 2 parts
+            project_unit = QgsProject.instance().areaUnits()
+            unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)
+            prompt = (
+                f"Total area: {original_area:.2f} {unit_abbrev}\n"
+                "Enter number of parts:"
+            )
+
             num_parts, ok = QInputDialog.getInt(
-                None, "Equal Parts", "Enter number of parts:",
-                value=2, min=2, max=max_parts
+                None, 
+                "Equal Parts", 
+                prompt,  # Now includes total area
+                value=2, 
+                min=2, 
+                max=max_parts  # Uses project units for min/max
             )
             if not ok or num_parts < 1:
                 return
