@@ -5,7 +5,10 @@
 
 Whether you're dividing land parcels, planning urban zones, or analyzing ecological regions,  **Equalyzer**  empowers you to split polygons with surgical accuracy—directly within QGIS. Say goodbye to manual calculations and hello to smart, automated splitting that  _snaps to reality_!
 
+![](https://github.com/danzig666/Equalyzer/blob/main/screencapture.gif)
+
 ----------
+
 
 ### **🔥 Key Features**
 
