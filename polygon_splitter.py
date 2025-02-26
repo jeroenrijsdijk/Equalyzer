@@ -1,12 +1,12 @@
 from qgis.PyQt.QtCore import Qt, QEventLoop, QVariant
-from qgis.PyQt.QtWidgets import QAction, QMessageBox, QInputDialog, QPushButton
+from qgis.PyQt.QtWidgets import QAction, QMessageBox, QInputDialog
 from qgis.PyQt.QtGui import QIcon
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsGeometry, QgsWkbTypes,
     QgsField, QgsFeature, QgsUnitTypes, QgsDistanceArea,
     QgsVectorLayerSimpleLabeling, QgsPalLayerSettings,
     QgsTextFormat, QgsRectangle, QgsPointXY, QgsSnappingConfig,
-    QgsTolerance, QgsMapLayer
+    QgsTolerance, QgsMapLayer, QgsCoordinateTransform
 )
 from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand, QgsSnapIndicator
 from qgis.utils import iface
@@ -33,7 +33,7 @@ class LineDrawTool(QgsMapToolEmitPoint):
         for tree_layer in root.findLayers():
             if tree_layer.isVisible():
                 layer = tree_layer.layer()
-                if layer.type() == QgsMapLayer.VectorLayer:
+                if layer is not None and layer.type() == QgsMapLayer.VectorLayer:
                     visible_layers.append(layer)
         
         for layer in visible_layers:
@@ -135,9 +135,37 @@ class PolygonSplitter:
             if geom.isMultipart():
                 for part in geom.asMultiPolygon():
                     decomposed.append(QgsGeometry.fromPolygonXY(part))
+            elif geom.wkbType() == QgsWkbTypes.GeometryCollection:
+                for subgeom in geom.constGet():
+                    g = QgsGeometry(subgeom)
+                    if g.type() == QgsWkbTypes.PolygonGeometry:
+                        decomposed.append(g)
             else:
                 decomposed.append(geom)
         return decomposed
+
+    def clean_geometry(self, geom):
+        """
+        If a geometry is a GeometryCollection, try to clean it so that it is a valid multipolygon.
+        Uses a zero-buffer trick first, then decomposes and recombines polygon parts.
+        """
+        if geom.isEmpty():
+            return geom
+        if geom.wkbType() == QgsWkbTypes.GeometryCollection:
+            cleaned = geom.buffer(0, 0)
+            if cleaned and cleaned.wkbType() != QgsWkbTypes.GeometryCollection:
+                return cleaned
+            parts = []
+            for subgeom in geom.constGet():
+                g = QgsGeometry(subgeom)
+                if g.type() == QgsWkbTypes.PolygonGeometry:
+                    parts.append(g)
+            if parts:
+                union_geom = parts[0]
+                for part in parts[1:]:
+                    union_geom = union_geom.combine(part)
+                return union_geom
+        return geom
 
     def get_line_points(self):
         loop = QEventLoop()
@@ -188,10 +216,7 @@ class PolygonSplitter:
         da.setEllipsoid(QgsProject.instance().ellipsoid())
         da.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
 
-        # Calculate original area in the appropriate units (square meters or CRS units)
         original_area_measured = da.measureArea(original_geom)
-
-        # Convert original area to project units for display
         project_area_unit = QgsProject.instance().areaUnits()
         if da.willUseEllipsoid():
             original_area = QgsUnitTypes.fromUnitToUnitFactor(QgsUnitTypes.AreaSquareMeters, project_area_unit) * original_area_measured
@@ -206,31 +231,24 @@ class PolygonSplitter:
             original_area = QgsUnitTypes.fromUnitToUnitFactor(crs_area_unit, project_area_unit) * original_area_measured
 
         if self.mode == "area":
-            # Get project unit abbreviation for display
             project_unit = QgsProject.instance().areaUnits()
-            unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)  # e.g., "m²", "ha"
+            unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)
             prompt = (
                 f"Total area: {original_area:.2f} {unit_abbrev}\n"
                 f"Enter target area per part ({unit_abbrev}):"
             )
-
             expected_area_input, ok = QInputDialog.getDouble(
                 None, 
                 "Equal Area", 
-                prompt,  # Now includes total area
+                prompt,
                 value=1000.0, 
                 min=0.1, 
                 max=original_area, 
                 decimals=1
             )
-
             if not ok or expected_area_input <= 0:
                 return
-
-            # Calculate estimated parts before splitting
             estimated_parts = math.ceil(original_area / expected_area_input)
-            
-            # Show confirmation if estimate exceeds 1000
             if estimated_parts > 1000:
                 msg = QMessageBox(
                     QMessageBox.Warning,
@@ -241,56 +259,57 @@ class PolygonSplitter:
                 if msg.exec_() == QMessageBox.No:
                     self.iface.messageBar().pushInfo("Cancelled", "Operation aborted by user")
                     return
-
-            # Convert user input from project units to measurement units (square meters or CRS units)
             if da.willUseEllipsoid():
-                expected_area = QgsUnitTypes.fromUnitToUnitFactor(project_area_unit, QgsUnitTypes.AreaSquareMeters) * expected_area_input
+                expected_area = QgsUnitTypes.fromUnitToUnitFactor(project_unit, QgsUnitTypes.AreaSquareMeters) * expected_area_input
             else:
-                expected_area = QgsUnitTypes.fromUnitToUnitFactor(project_area_unit, crs_area_unit) * expected_area_input
+                expected_area = QgsUnitTypes.fromUnitToUnitFactor(project_unit, crs_area_unit) * expected_area_input
             num_parts = None
         else:
-            # Calculate max parts based on project units
-            max_parts = max(2, min(1000, int(original_area / 0.1)))  # Ensures min 2 parts
+            max_parts = max(2, min(1000, int(original_area / 0.1)))
             project_unit = QgsProject.instance().areaUnits()
             unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)
             prompt = (
                 f"Total area: {original_area:.2f} {unit_abbrev}\n"
                 "Enter number of parts:"
             )
-
             num_parts, ok = QInputDialog.getInt(
                 None, 
                 "Equal Parts", 
-                prompt,  # Now includes total area
+                prompt,
                 value=2, 
                 min=2, 
-                max=max_parts  # Uses project units for min/max
+                max=max_parts
             )
             if not ok or num_parts < 1:
                 return
             expected_area = original_area_measured / num_parts
 
-        # Get direction line
+        # Get direction line and transform to layer CRS if needed
         self.get_line_points()
         if not self.current_points or len(self.current_points) != 2:
             raise Exception("Direction line not properly drawn!")
-        
         point_a, point_b = self.current_points
-
-        # Handle area mode specific logic
+        if self.canvas.mapSettings().destinationCrs() != layer.crs():
+            transform = QgsCoordinateTransform(self.canvas.mapSettings().destinationCrs(), layer.crs(), QgsProject.instance())
+            point_a = transform.transform(point_a)
+            point_b = transform.transform(point_b)
+        
+        # Area mode: adjust based on clicked point
         if self.mode == "area":
             self.get_clicked_point()
             if not self.clicked_point:
                 raise Exception("No point selected!")
-            if not original_geom.intersects(QgsGeometry.fromPointXY(self.clicked_point)):
+            clicked_point = self.clicked_point
+            if self.canvas.mapSettings().destinationCrs() != layer.crs():
+                clicked_point = transform.transform(clicked_point)
+            if not original_geom.intersects(QgsGeometry.fromPointXY(clicked_point)):
                 raise Exception("Clicked point is not on the polygon!")
-
             center = QgsPointXY((point_a.x() + point_b.x())/2, (point_a.y() + point_b.y())/2)
             dx = point_b.x() - point_a.x()
             dy = point_b.y() - point_a.y()
             angle_rad = math.atan2(dy, dx)
             angle_deg = math.degrees(angle_rad)
-            clicked_geom = QgsGeometry.fromPointXY(self.clicked_point)
+            clicked_geom = QgsGeometry.fromPointXY(clicked_point)
             clicked_geom.rotate(angle_deg, center)
             rotated_clicked = clicked_geom.asPoint()
             rotated_original = QgsGeometry(original_geom)
@@ -300,14 +319,12 @@ class PolygonSplitter:
             if rotated_clicked.y() > mid_y:
                 point_a, point_b = point_b, point_a
 
-        # Calculate rotation parameters
         center = QgsPointXY((point_a.x() + point_b.x())/2, (point_a.y() + point_b.y())/2)
         dx = point_b.x() - point_a.x()
         dy = point_b.y() - point_a.y()
         angle_rad = math.atan2(dy, dx)
         angle_deg = -math.degrees(angle_rad)
 
-        # Splitting logic with correct area measurements
         def split_geometry(geom, angle_deg, center_point, target_area):
             parts = []
             remaining_geom = geom
@@ -321,19 +338,22 @@ class PolygonSplitter:
                 best_y = high
                 for _ in range(20):
                     mid = (low + high) / 2
-                    clip_rect = QgsRectangle(-1e6, -1e6, 1e6, mid)
+                    clip_rect = QgsRectangle(bbox.xMinimum(), bbox.yMinimum(), bbox.xMaximum(), mid)
                     clip_geom = QgsGeometry.fromRect(clip_rect)
                     temp_part = rotated_geom.intersection(clip_geom)
+                    temp_part = self.clean_geometry(temp_part)
                     temp_area = da.measureArea(temp_part)
                     if temp_area < target_area:
                         low = mid
                     else:
                         high = mid
                         best_y = high
-                final_clip = QgsGeometry.fromRect(QgsRectangle(-1e6, -1e6, 1e6, best_y))
+                final_clip = QgsGeometry.fromRect(QgsRectangle(bbox.xMinimum(), bbox.yMinimum(), bbox.xMaximum(), best_y))
                 final_clip.rotate(angle_deg, center_point)
                 lower_part = remaining_geom.intersection(final_clip)
+                lower_part = self.clean_geometry(lower_part)
                 upper_part = remaining_geom.difference(final_clip)
+                upper_part = self.clean_geometry(upper_part)
                 lower_area = da.measureArea(lower_part)
                 if lower_part.isEmpty() or lower_area < target_area * 0.95:
                     break
@@ -341,16 +361,21 @@ class PolygonSplitter:
                 remaining_geom = upper_part
                 total_area = da.measureArea(remaining_geom)
             if not remaining_geom.isEmpty() and da.measureArea(remaining_geom) > 0.01:
-                parts.append(remaining_geom)
+                leftover_area = da.measureArea(remaining_geom)
+                if parts and leftover_area < (target_area * 0.05):
+                    parts[-1] = parts[-1].combine(remaining_geom)
+                else:
+                    parts.append(remaining_geom)
             return parts
 
         try:
             split_parts = split_geometry(original_geom, angle_deg, center, expected_area)
             split_parts = self.decompose_multiparts(split_parts)
+            # Filter out any parts with near-zero area
+            split_parts = [part for part in split_parts if da.measureArea(part) > 0.01]
         except Exception as e:
             raise Exception(f"Splitting failed: {str(e)}")
 
-        # Create output layer with corrected area calculation
         crs = layer.crs().authid()
         output_layer = QgsVectorLayer(f"Polygon?crs={crs}", "Split Parts", "memory")
         provider = output_layer.dataProvider()
@@ -359,7 +384,6 @@ class PolygonSplitter:
 
         project_unit = QgsProject.instance().areaUnits()
         unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)
-
         original_attributes = selected_feature.attributes()
 
         for part in split_parts:
@@ -385,7 +409,6 @@ class PolygonSplitter:
         output_layer.updateExtents()
         QgsProject.instance().addMapLayer(output_layer)
 
-        # Configure labels with correct area units
         label_settings = QgsPalLayerSettings()
         label_settings.enabled = True
         label_settings.isExpression = True
