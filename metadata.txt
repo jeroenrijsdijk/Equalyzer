@@ -2,17 +2,70 @@
 name=Equalyzer - Split Polygons into Equal Areas or Parts
 qgisMinimumVersion=3.16
 description=Splits polygons into equal areas or equal parts easily
-version=1.0
+version=1.4.5
 author=Abel Koszeghy
 email=abelke@gmail.com
 
-about=Equalyzer - Split Polygons into Equal Areas or Parts
+about=Equalyzer - Split Polygons into Equal Areas or Parts. Select a polygon on the current layer, choose either of the two options (equal area/equal parts) and after processing it creates a memory layer with the expected division.
 
 homepage=https://github.com/danzig666/Equalyzer
 tracker=https://github.com/danzig666/Equalyzer/issues
 repository=https://github.com/danzig666/Equalyzer
 
-changelog = 1.0 Initial version
+changelog = 1.4.5 Added strict straight-cut splitting as the primary path for area and count modes, preserving original polygon boundaries except at real cut intersections. Falls back to the connected splitter when strict cuts cannot keep connected single-polygon parts, and now reports fallback use in Preview, Apply, and the QGIS message log. Updated splitGeometry calls for QGIS 3/4 compatibility.
+  1.4.2 Added saved Precision setting for connected concave splitting. Higher precision uses finer strip graphs, multiple seed offsets and more rebalancing iterations; dialog geometry is saved/restored through QGIS settings.
+  1.4.1 Removed unsupported QgsGeometry.boundary() call for older QGIS versions. Uses bbox-overlap plus geometry distance for strip adjacency. Evaluates multiple strip resolutions and keeps the best balanced exact-count result.
+  1.4.0 Replaced count-mode concave splitting with connected graph partitioning. Produces exactly the requested number of connected output polygons. Added boundary-node rebalancing to improve equal-area results on irregular shapes.
+  1.2.16 Apply is now enabled as soon as a valid direction line is set (Preview is optional).
+  Clearing preview no longer disables Apply when direction is still available.
+  1.2.15 Replaced blocking apply flow with signal-driven non-blocking dialog handling to bypass exec_ deadlock on Apply.
+  Split/output pipeline now runs from accepted callback with explicit "Apply callback entered" marker.
+  1.2.14 Fixed Apply deadlock path by removing preview-band scene cleanup from dialog accept/close lifecycle (cleanup is deferred to plugin-level run boundaries).
+  Added explicit marker after dialog returns from exec_ to confirm pipeline continuation.
+  1.2.13 Added hard runtime markers (plugin load, Apply click, split entry) to diagnose silent Apply failures.
+  Made dialog Apply path exception-safe so preview cleanup cannot block execution of the split pipeline.
+  1.2.12 Added visible apply/output diagnostics to QGIS message bar.
+  Restored MultiPolygon output workflow and normalized all written geometries to multipolygon-safe parts.
+  Output layer is now inserted into project before writing for deterministic visibility on Apply.
+  1.2.11 Removed early-terminate apply path that could bypass emergency fallback when primary output feature list was empty.
+  Forced zero-feature apply runs through emergency temporary memory-layer creation path.
+  1.2.10 Added emergency temporary memory-layer fallback if regular output add/write path fails.
+  Switched primary output geometry to Polygon for broader provider compatibility.
+  1.2.9 Fixed oblique-direction cut orientation by aligning with QGIS clockwise rotation semantics.
+  Added explicit preview cleanup on dialog OK (accept).
+  Simplified output layer schema for robust memory-layer feature insertion.
+  1.2.8 Apply flow now always recomputes split from final dialog parameters.
+  Output memory layer is written before adding to project for deterministic creation behavior.
+  Added explicit direction/cut angle diagnostics to log.
+  1.2.7 Aligned cut orientation with drawn direction line (cuts parallel to line).
+  Strengthened memory-layer output creation flow (layer added deterministically).
+  Expanded global preview cleanup hooks for project open/new/clear.
+  1.2.6 Apply now reuses exact preview geometries for writing.
+  Improved split robustness for opposite sweep directions.
+  Hardened output memory-layer writing for mixed polygon/multipolygon cases.
+  Added global preview-rubber-band cleanup (including project reset/new project).
+  1.2.5 Added robust output-layer insertion diagnostics to QGIS log.
+  Added fallback output creation via temporary GeoJSON when memory-layer insertion fails.
+  Added clearer user-facing error messages for write/add failures.
+  1.2.4 Fixed apply/output layer creation by using a single consistent split computation path.
+  Improved equal-area splitting so it does not stop too early.
+  Added explicit output write-failure checks and user feedback.
+  1.2.3 Fixed cut orientation math so split lines are perpendicular to the drawn direction line.
+  Added validation for degenerate/too-short direction lines.
+  Improved direction status display to include both drawn and effective cut angles.
+  1.2.2 Reworked interactive map picking to avoid nested event loops.
+  Fixed Windows focus/deadlock behavior where QGIS could freeze after selecting the second direction-line point.
+  1.2.1 Fixed freeze/unresponsive behavior after selecting the second point of the direction line.
+  Added safer map-tool event-loop cleanup and error handling to prevent UI lockups.
+  1.2 Fixed splitting direction logic (cuts now correctly perpendicular to drawn line).
+  Fixed CRS handling (transform always defined and applied consistently).
+  Fixed starting side logic using projected coordinates in rotated space.
+  Added interactive preview dialog with rubber band display and per-part area info.
+  Improved binary search precision (50 iterations).
+  Fixed leftover merging threshold (50% of target area).
+  Better error handling and user feedback.
+  1.1 Use area units from project settings, some bugfixes
+  1.0 Initial version
 
 hasProcessingProvider=no
 
@@ -29,4 +82,3 @@ category=Vector
 
 # If the plugin can run on QGIS Server.
 server=False
-
