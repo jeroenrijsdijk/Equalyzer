@@ -1,80 +1,40 @@
+# Equalyzer
 
-**🌟 Equalyzer: Precision Polygon Division Made Simple 🌟**
+Equalyzer is a QGIS Python plugin for splitting selected polygon features into equal-area parts or into a requested number of parts.
 
-**Transform complex polygon splitting into a seamless, precise workflow!**
+## Requirements
 
-Whether you're dividing land parcels, planning urban zones, or analyzing ecological regions,  **Equalyzer**  empowers you to split polygons with surgical accuracy—directly within QGIS. Say goodbye to manual calculations and hello to smart, automated splitting that  _snaps to reality_!
+- QGIS 3.16 or newer
+- A polygon or multipolygon vector layer
+- A projected CRS is recommended for accurate area work
 
-![](https://github.com/danzig666/Equalyzer/blob/main/screencapture.gif)
+## Usage
 
-----------
+1. Select one or more polygon features.
+2. Start either `Equal Area` or `Equal Parts` from the plugin menu or toolbar.
+3. Draw a direction line on the map. Cut lines are created parallel to this line.
+4. Optionally pick the side to start from.
+5. Set the target area or number of parts.
+6. Use `Preview` to inspect the result, then `Apply` to create the output layer.
 
+The plugin creates a new temporary layer with these fields:
 
-### **🔥 Key Features**
+- `source_fid`
+- `part_id`
+- `area_val`
+- `area_txt`
 
--   **Two Powerful Modes in One Tool:**
-    
-    -   🎯  **Equal Area Splits**: Define exact target areas (perfect for land division or habitat management)
-        
-    -   🔢  **Equal Part Count**: Split into precise N segments (ideal for sampling grids or administrative redistricting)
-        
--   **Smart Snapping Technology**  
-    Draw direction lines that  **auto-snap to points/vertices**  from  _any visible layer_—ensuring perfect alignment with existing infrastructure, survey markers, or natural features.
-    
--   **Visual Workflow**  
-    Real-time rubber band previews and snapping indicators make every split intuitive.
-    
--   **Geo-Accurate Results**  
-    Preserves original attributes and CRS, outputting clean, analysis-ready polygons.
-    
--   **Absolutely Free and Open-Source**  
+## Splitting behavior
 
-----------
+The primary splitter uses straight cuts and `QgsGeometry.splitGeometry()` so the original polygon boundary is preserved except where a real cut intersects it.
 
-### **🚀 Who Needs This?**
+For area mode, full parts are created at the requested target area. Any remaining area is kept as the final part.
 
--   **Land Surveyors**  creating equal-value parcels
-    
--   **Urban Planners**  designing zoning districts
-    
--   **Ecologists**  establishing sampling quadrats
-    
--   **GIS Analysts**  prepping data for spatial models
-    
--   **Local Governments**  redistricting administrative boundaries
-    
-----------
+For difficult concave polygons, a straight cut may not be able to keep both sides as single connected polygons. In that case Equalyzer falls back to the connected splitter. The fallback is reported in Preview, Apply, and the QGIS message log. Fallback output can contain extra short boundary segments because it uses a strip-based connected partition.
 
-### **💡 Why Choose Equalyzer?**
+## Notes
 
-✅  **Save Hours**  vs. manual digitizing  
-✅  **Reduce Errors**  with mathematical precision  
-✅  **Maintain Topology**  with smart splitting logic  
-✅  **Stay in QGIS**—no external software required
+- Area values are measured with QGIS `QgsDistanceArea`.
+- If ellipsoid measurement is enabled in the project, areas are measured using the project ellipsoid.
+- Higher precision affects the connected fallback splitter, not the strict straight-cut path.
 
-----------
-
-### **🛠️ Technical Highlights**
-
--   **QGIS 3.16+ Compatible**
-    
--   **Open-Source Core**  with professional-grade reliability
-    
--   **Preserves Attribute Data**  in output layers
-    
-
-----------
-
-**📥 Get Splitting Today!**  
-Available now in the QGIS Plugin Repository. Transform your polygon workflows from frustrating to frictionless—**one perfect split at a time**.
-
-_"Finally, a splitting tool that thinks like a GIS professional!"_  
-— Early User Review (_yeah that's made up_)
-
-**🔗 Download Now & Revolutionize Your Spatial Analysis!**
-
-----------
-
-**Perfect for:**  Land management • Environmental monitoring • Urban planning • Agricultural zoning • Infrastructure development • Academic research
-
-_(yeah, this marketing-speak was written by DeepSeek, sorry :) )_
