@@ -1,7 +1,13 @@
 """
 Equalyzer - Split Polygons into Equal Areas or Parts
-Version 1.4.5
+Version 1.5.0
 Author: Abel Koszeghy
+
+Improvements in 1.5.0:
+- Runs on QGIS 4 (Qt6) as well as QGIS 3 (Qt5)
+- All Qt and QGIS enums use their fully scoped, version-neutral spelling
+- QgsField creation, snapping configuration and vector file writing go
+  through a single compatibility layer near the top of this file
 
 Improvements in 1.4.5:
 - Reworked target-area mode as a weighted connected partition
@@ -138,11 +144,22 @@ Improvements in 1.2:
 
 from qgis.PyQt.QtCore import Qt, QVariant, QSettings
 from qgis.PyQt.QtWidgets import (
-    QAction, QMessageBox, QInputDialog, QDialog, QVBoxLayout,
+    QMessageBox, QInputDialog, QDialog, QVBoxLayout,
     QHBoxLayout, QLabel, QPushButton, QDoubleSpinBox, QSpinBox,
     QGroupBox, QFormLayout, QDialogButtonBox, QSizePolicy, QFrame
 )
 from qgis.PyQt.QtGui import QIcon, QColor, QFont
+
+# QAction lives in QtWidgets on Qt5 and in QtGui on Qt6.
+try:
+    from qgis.PyQt.QtWidgets import QAction
+except ImportError:
+    from qgis.PyQt.QtGui import QAction
+
+try:
+    from qgis.PyQt.QtCore import QMetaType
+except ImportError:          # pragma: no cover - Qt5 builds without QMetaType
+    QMetaType = None
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsGeometry, QgsWkbTypes,
     QgsFeature, QgsUnitTypes, QgsDistanceArea,
@@ -161,6 +178,158 @@ import uuid
 
 
 # ---------------------------------------------------------------------------
+# QGIS 3 / QGIS 4 compatibility layer
+#
+# QGIS 4 runs on Qt6, where PyQt enums are strictly scoped: Qt.red no longer
+# exists, only Qt.GlobalColor.red.  The scoped spelling also works on Qt5, so
+# everywhere else in this file enums are simply written in their scoped form.
+#
+# Only the handful of cases that need a real runtime decision live here.  When
+# support for QGIS < 3.38 is eventually dropped, this whole block can go.
+# ---------------------------------------------------------------------------
+
+QGIS_VERSION_INT = Qgis.QGIS_VERSION_INT
+
+
+def _resolve_enum(*candidates):
+    """Return the first spelling of an enum value that this QGIS provides.
+
+    Each candidate is (owner, holder_name_or_None, member_name).  QGIS 3.30+
+    moved many enums into the Qgis namespace and renamed their members
+    (QgsUnitTypes.AreaSquareMeters -> Qgis.AreaUnit.SquareMeters), keeping the
+    old names as aliases.  Asking instead of assuming keeps one code path.
+    """
+    for owner, holder_name, member in candidates:
+        holder = owner if holder_name is None else getattr(owner, holder_name, None)
+        if holder is not None and hasattr(holder, member):
+            return getattr(holder, member)
+    raise AttributeError(f"No known spelling for {candidates[0]}")
+
+
+def _area_unit(new_member, legacy_member):
+    return _resolve_enum(
+        (Qgis, "AreaUnit", new_member),
+        (QgsUnitTypes, "AreaUnit", legacy_member),
+        (QgsUnitTypes, None, legacy_member),
+    )
+
+
+def _distance_unit(new_member, legacy_member):
+    return _resolve_enum(
+        (Qgis, "DistanceUnit", new_member),
+        (QgsUnitTypes, "DistanceUnit", legacy_member),
+        (QgsUnitTypes, None, legacy_member),
+    )
+
+
+AREA_SQUARE_METERS = _area_unit("SquareMeters", "AreaSquareMeters")
+AREA_SQUARE_FEET = _area_unit("SquareFeet", "AreaSquareFeet")
+AREA_SQUARE_DEGREES = _area_unit("SquareDegrees", "AreaSquareDegrees")
+DISTANCE_METERS = _distance_unit("Meters", "DistanceMeters")
+DISTANCE_FEET = _distance_unit("Feet", "DistanceFeet")
+DISTANCE_DEGREES = _distance_unit("Degrees", "DistanceDegrees")
+
+# Geometry / WKB / layer types: Qgis.* names since 3.30, legacy names before.
+WKB_POLYGON = _resolve_enum(
+    (Qgis, "WkbType", "Polygon"),
+    (QgsWkbTypes, "Type", "Polygon"),
+    (QgsWkbTypes, None, "Polygon"),
+)
+WKB_MULTIPOLYGON = _resolve_enum(
+    (Qgis, "WkbType", "MultiPolygon"),
+    (QgsWkbTypes, "Type", "MultiPolygon"),
+    (QgsWkbTypes, None, "MultiPolygon"),
+)
+WKB_GEOMETRYCOLLECTION = _resolve_enum(
+    (Qgis, "WkbType", "GeometryCollection"),
+    (QgsWkbTypes, "Type", "GeometryCollection"),
+    (QgsWkbTypes, None, "GeometryCollection"),
+)
+GEOM_LINE = _resolve_enum(
+    (Qgis, "GeometryType", "Line"),
+    (QgsWkbTypes, "GeometryType", "LineGeometry"),
+    (QgsWkbTypes, None, "LineGeometry"),
+)
+GEOM_POLYGON = _resolve_enum(
+    (Qgis, "GeometryType", "Polygon"),
+    (QgsWkbTypes, "GeometryType", "PolygonGeometry"),
+    (QgsWkbTypes, None, "PolygonGeometry"),
+)
+LAYER_VECTOR = _resolve_enum(
+    (Qgis, "LayerType", "Vector"),
+    (QgsMapLayer, "LayerType", "VectorLayer"),
+    (QgsMapLayer, None, "VectorLayer"),
+)
+
+# (QMetaType.Type member, QVariant member) per logical field type
+_FIELD_TYPE_NAMES = {
+    "longlong": ("LongLong", "LongLong"),
+    "int": ("Int", "Int"),
+    "double": ("Double", "Double"),
+    "string": ("QString", "String"),
+}
+
+
+def compat_field(name, type_key):
+    """Build a QgsField without depending on QVariant.Type (gone in Qt6).
+
+    QGIS >= 3.38 accepts QMetaType.Type; older releases only accept
+    QVariant.Type, which PyQt5 still provides.
+    """
+    meta_name, variant_name = _FIELD_TYPE_NAMES[type_key]
+    if QMetaType is not None and QGIS_VERSION_INT >= 33800:
+        return QgsField(name, getattr(QMetaType.Type, meta_name))
+    return QgsField(name, getattr(QVariant, variant_name))
+
+
+def compat_snapping_enums():
+    """Return (snapping_mode, vertex_type, tolerance_unit) for this QGIS.
+
+    The Qgis.* spellings exist since 3.26 and are the only ones left in
+    QGIS 4; the QgsSnappingConfig.*/QgsTolerance.* ones cover 3.16 - 3.24.
+    """
+    mode = _resolve_enum(
+        (Qgis, "SnappingMode", "AdvancedConfiguration"),
+        (QgsSnappingConfig, "SnappingMode", "AdvancedConfiguration"),
+        (QgsSnappingConfig, None, "AdvancedConfiguration"),
+    )
+    vertex = _resolve_enum(
+        (Qgis, "SnappingType", "Vertex"),
+        (QgsSnappingConfig, "SnappingType", "Vertex"),
+        (QgsSnappingConfig, None, "Vertex"),
+    )
+    unit = _resolve_enum(
+        (Qgis, "MapToolUnit", "Pixels"),
+        (QgsTolerance, "UnitType", "Pixels"),
+        (QgsTolerance, None, "Pixels"),
+    )
+    return mode, vertex, unit
+
+
+def compat_write_vector(layer, path, driver="GeoJSON", encoding="UTF-8"):
+    """Write a layer to file. Returns (error_code, message).
+
+    writeAsVectorFormatV3() is available since QGIS 3.20; the pre-3.20
+    signature is kept as a fallback.
+    """
+    if hasattr(QgsVectorFileWriter, "writeAsVectorFormatV3"):
+        options = QgsVectorFileWriter.SaveVectorOptions()
+        options.driverName = driver
+        options.fileEncoding = encoding
+        result = QgsVectorFileWriter.writeAsVectorFormatV3(
+            layer, path, QgsProject.instance().transformContext(), options
+        )
+    else:  # pragma: no cover - QGIS < 3.20
+        result = QgsVectorFileWriter.writeAsVectorFormat(
+            layer, path, encoding, layer.crs(), driver
+        )
+
+    if isinstance(result, tuple):
+        return result[0], result[1] if len(result) > 1 else ""
+    return result, ""
+
+
+# ---------------------------------------------------------------------------
 # Map Tools
 # ---------------------------------------------------------------------------
 
@@ -172,26 +341,33 @@ class LineDrawTool(QgsMapToolEmitPoint):
         self.canvas = canvas
         self.callback = callback
         self.points = []
-        self.rubber_band = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
-        self.rubber_band.setColor(Qt.red)
+        self.rubber_band = QgsRubberBand(canvas, GEOM_LINE)
+        self.rubber_band.setColor(QColor(Qt.GlobalColor.red))
         self.rubber_band.setWidth(2)
 
         self.snapping_utils = canvas.snappingUtils()
         self.snapping_config = QgsSnappingConfig()
-        self.snapping_config.setMode(QgsSnappingConfig.AdvancedConfiguration)
-        self.snapping_config.setEnabled(True)
+        try:
+            snap_mode, snap_vertex, snap_unit = compat_snapping_enums()
+            self.snapping_config.setMode(snap_mode)
+            self.snapping_config.setEnabled(True)
 
-        root = QgsProject.instance().layerTreeRoot()
-        for tree_layer in root.findLayers():
-            if tree_layer.isVisible():
-                layer = tree_layer.layer()
-                if layer is not None and layer.type() == QgsMapLayer.VectorLayer:
-                    settings = QgsSnappingConfig.IndividualLayerSettings(
-                        True, QgsSnappingConfig.Vertex, 10, QgsTolerance.Pixels
-                    )
-                    self.snapping_config.setIndividualLayerSettings(layer, settings)
+            root = QgsProject.instance().layerTreeRoot()
+            for tree_layer in root.findLayers():
+                if tree_layer.isVisible():
+                    layer = tree_layer.layer()
+                    if layer is not None and layer.type() == LAYER_VECTOR:
+                        settings = QgsSnappingConfig.IndividualLayerSettings(
+                            True, snap_vertex, 10, snap_unit
+                        )
+                        self.snapping_config.setIndividualLayerSettings(layer, settings)
 
-        self.snapping_utils.setConfig(self.snapping_config)
+            self.snapping_utils.setConfig(self.snapping_config)
+        except Exception as e:
+            # Snapping is a convenience, not a requirement: never block the tool.
+            QgsMessageLog.logMessage(
+                f"Snapping setup skipped: {e}", "Equalyzer", Qgis.MessageLevel.Warning
+            )
         self.snap_indicator = QgsSnapIndicator(canvas)
         iface.messageBar().pushInfo(
             "Equalyzer",
@@ -204,13 +380,13 @@ class LineDrawTool(QgsMapToolEmitPoint):
         match = self.snapping_utils.snapToMap(map_pos)
         self.snap_indicator.setMatch(match)
         if len(self.points) == 1:
-            self.rubber_band.reset(QgsWkbTypes.LineGeometry)
+            self.rubber_band.reset(GEOM_LINE)
             self.rubber_band.addPoint(self.points[0])
             self.rubber_band.addPoint(match.point() if match.isValid() else map_pos)
 
     def canvasReleaseEvent(self, event):
         try:
-            if event.button() == Qt.RightButton:
+            if event.button() == Qt.MouseButton.RightButton:
                 self._abort()
                 return
             map_pos = self.toMapCoordinates(event.pos())
@@ -220,7 +396,7 @@ class LineDrawTool(QgsMapToolEmitPoint):
             if len(self.points) == 1:
                 iface.messageBar().pushInfo("Equalyzer", "Click second point for direction line.")
             elif len(self.points) == 2:
-                self.rubber_band.reset(QgsWkbTypes.LineGeometry)
+                self.rubber_band.reset(GEOM_LINE)
                 self.canvas.unsetMapTool(self)
                 self.callback(self.points)
         except Exception as e:
@@ -231,11 +407,11 @@ class LineDrawTool(QgsMapToolEmitPoint):
             self._abort()
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Qt.Key.Key_Escape:
             self._abort()
 
     def _abort(self):
-        self.rubber_band.reset(QgsWkbTypes.LineGeometry)
+        self.rubber_band.reset(GEOM_LINE)
         self.points = []
         self.canvas.unsetMapTool(self)
         self.callback(None)
@@ -255,7 +431,7 @@ class PointSelectTool(QgsMapToolEmitPoint):
         )
 
     def canvasReleaseEvent(self, event):
-        if event.button() == Qt.RightButton:
+        if event.button() == Qt.MouseButton.RightButton:
             self.canvas.unsetMapTool(self)
             self.callback(None)
             return
@@ -264,7 +440,7 @@ class PointSelectTool(QgsMapToolEmitPoint):
         self.callback(point)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Qt.Key.Key_Escape:
             self.canvas.unsetMapTool(self)
             self.callback(None)
 
@@ -371,8 +547,8 @@ class SplitPreviewDialog(QDialog):
         main_layout.addWidget(info)
 
         sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setFrameShadow(QFrame.Sunken)
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
         main_layout.addWidget(sep)
 
         # ---- Parameter group ----
@@ -475,14 +651,14 @@ class SplitPreviewDialog(QDialog):
 
         # ---- Buttons ----
         sep2 = QFrame()
-        sep2.setFrameShape(QFrame.HLine)
-        sep2.setFrameShadow(QFrame.Sunken)
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setFrameShadow(QFrame.Shadow.Sunken)
         main_layout.addWidget(sep2)
 
         btn_box = QDialogButtonBox()
-        self.apply_btn = btn_box.addButton("Apply", QDialogButtonBox.AcceptRole)
+        self.apply_btn = btn_box.addButton("Apply", QDialogButtonBox.ButtonRole.AcceptRole)
         self.apply_btn.setEnabled(False)
-        btn_box.addButton("Cancel", QDialogButtonBox.RejectRole)
+        btn_box.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
         btn_box.accepted.connect(self.accept)
         btn_box.rejected.connect(self._on_cancel)
         main_layout.addWidget(btn_box)
@@ -498,7 +674,7 @@ class SplitPreviewDialog(QDialog):
         if self.da.willUseEllipsoid():
             # da returns sq metres when using ellipsoid
             return QgsUnitTypes.fromUnitToUnitFactor(
-                QgsUnitTypes.AreaSquareMeters, self.project_unit
+                AREA_SQUARE_METERS, self.project_unit
             ) * area_sq_m_or_crs
         else:
             return QgsUnitTypes.fromUnitToUnitFactor(
@@ -758,7 +934,7 @@ class SplitPreviewDialog(QDialog):
         total_parts = len(all_parts)
         area_texts = []
         for i, part_geom in enumerate(all_parts):
-            band = QgsRubberBand(canvas, QgsWkbTypes.PolygonGeometry)
+            band = QgsRubberBand(canvas, GEOM_POLYGON)
             setattr(band, "_equalyzer_preview_band", True)
             colour = colours[i % len(colours)]
             band.setColor(colour)
@@ -954,7 +1130,7 @@ class _SplitEngine:
         if self.da.willUseEllipsoid():
             # da.measureArea returns sq metres
             return QgsUnitTypes.fromUnitToUnitFactor(
-                self.project_unit, QgsUnitTypes.AreaSquareMeters
+                self.project_unit, AREA_SQUARE_METERS
             ) * value
         else:
             return QgsUnitTypes.fromUnitToUnitFactor(
@@ -1379,9 +1555,9 @@ class _SplitEngine:
         if geom is None or geom.isEmpty():
             return False
         flat = QgsWkbTypes.flatType(geom.wkbType())
-        if flat == QgsWkbTypes.Polygon:
+        if flat == WKB_POLYGON:
             return self.da.measureArea(geom) > 1e-8
-        if flat == QgsWkbTypes.MultiPolygon:
+        if flat == WKB_MULTIPOLYGON:
             try:
                 return len(geom.asMultiPolygon()) == 1 and self.da.measureArea(geom) > 1e-8
             except Exception:
@@ -1988,9 +2164,9 @@ class _SplitEngine:
         try:
             flat = QgsWkbTypes.flatType(geom.wkbType())
             polys = []
-            if flat == QgsWkbTypes.Polygon:
+            if flat == WKB_POLYGON:
                 polys = [geom.asPolygon()]
-            elif flat == QgsWkbTypes.MultiPolygon:
+            elif flat == WKB_MULTIPOLYGON:
                 polys = geom.asMultiPolygon()
             for poly in polys:
                 for ring in poly:
@@ -2527,10 +2703,10 @@ class _SplitEngine:
                     g = QgsGeometry.fromPolygonXY(part)
                     if not g.isEmpty():
                         decomposed.append(g)
-            elif geom.wkbType() == QgsWkbTypes.GeometryCollection:
+            elif geom.wkbType() == WKB_GEOMETRYCOLLECTION:
                 for subgeom in geom.constGet():
                     g = QgsGeometry(subgeom)
-                    if g.type() == QgsWkbTypes.PolygonGeometry and not g.isEmpty():
+                    if g.type() == GEOM_POLYGON and not g.isEmpty():
                         decomposed.append(g)
             else:
                 decomposed.append(geom)
@@ -2540,16 +2716,16 @@ class _SplitEngine:
         if geom is None or geom.isEmpty():
             return QgsGeometry()
         wkb = geom.wkbType()
-        if wkb == QgsWkbTypes.GeometryCollection or \
-                QgsWkbTypes.flatType(wkb) == QgsWkbTypes.GeometryCollection:
+        if wkb == WKB_GEOMETRYCOLLECTION or \
+                QgsWkbTypes.flatType(wkb) == WKB_GEOMETRYCOLLECTION:
             cleaned = geom.buffer(0, 0)
             if cleaned and not cleaned.isEmpty() and \
-                    QgsWkbTypes.flatType(cleaned.wkbType()) != QgsWkbTypes.GeometryCollection:
+                    QgsWkbTypes.flatType(cleaned.wkbType()) != WKB_GEOMETRYCOLLECTION:
                 return cleaned
             parts = []
             for subgeom in geom.constGet():
                 g = QgsGeometry(subgeom)
-                if g.type() == QgsWkbTypes.PolygonGeometry:
+                if g.type() == GEOM_POLYGON:
                     parts.append(g)
             if parts:
                 union_geom = parts[0]
@@ -2601,7 +2777,7 @@ class PolygonSplitter:
         try:
             iface.messageBar().pushInfo(
                 "Equalyzer",
-                f"Loaded v1.4.5 from {os.path.abspath(__file__)}"
+                f"Loaded v1.5.0 from {os.path.abspath(__file__)}"
             )
         except Exception:
             pass
@@ -2690,13 +2866,13 @@ class PolygonSplitter:
         except Exception:
             pass
 
-    def _log(self, message, level=Qgis.Info, to_bar=False):
+    def _log(self, message, level=Qgis.MessageLevel.Info, to_bar=False):
         QgsMessageLog.logMessage(message, "Equalyzer", level)
-        if to_bar or level in (Qgis.Warning, Qgis.Critical):
+        if to_bar or level in (Qgis.MessageLevel.Warning, Qgis.MessageLevel.Critical):
             try:
-                if level == Qgis.Critical:
+                if level == Qgis.MessageLevel.Critical:
                     iface.messageBar().pushCritical("Equalyzer", message)
-                elif level == Qgis.Warning:
+                elif level == Qgis.MessageLevel.Warning:
                     iface.messageBar().pushWarning("Equalyzer", message)
                 else:
                     iface.messageBar().pushInfo("Equalyzer", message)
@@ -2724,26 +2900,26 @@ class PolygonSplitter:
         flat = QgsWkbTypes.flatType(g.wkbType())
         out = []
 
-        if flat == QgsWkbTypes.Polygon:
+        if flat == WKB_POLYGON:
             poly = g.asPolygon()
             if poly:
                 mp = QgsGeometry.fromMultiPolygonXY([poly])
                 if not mp.isEmpty():
                     out.append(mp)
-        elif flat == QgsWkbTypes.MultiPolygon:
+        elif flat == WKB_MULTIPOLYGON:
             for poly in g.asMultiPolygon():
                 if poly:
                     mp = QgsGeometry.fromMultiPolygonXY([poly])
                     if not mp.isEmpty():
                         out.append(mp)
-        elif flat == QgsWkbTypes.GeometryCollection:
+        elif flat == WKB_GEOMETRYCOLLECTION:
             try:
                 for sub in g.constGet():
                     out.extend(self._extract_multipolygon_parts(QgsGeometry(sub)))
             except Exception:
                 cleaned = g.buffer(0, 0)
                 if cleaned and not cleaned.isEmpty() and \
-                        QgsWkbTypes.flatType(cleaned.wkbType()) != QgsWkbTypes.GeometryCollection:
+                        QgsWkbTypes.flatType(cleaned.wkbType()) != WKB_GEOMETRYCOLLECTION:
                     out.extend(self._extract_multipolygon_parts(cleaned))
 
         return out
@@ -2763,7 +2939,7 @@ class PolygonSplitter:
 
         self._log(
             "Adding in-memory layer failed; attempting GeoJSON fallback.",
-            Qgis.Warning
+            Qgis.MessageLevel.Warning
         )
 
         tmp_path = os.path.join(
@@ -2771,22 +2947,9 @@ class PolygonSplitter:
             f"equalyzer_split_{uuid.uuid4().hex[:10]}.geojson"
         )
 
-        write_result = QgsVectorFileWriter.writeAsVectorFormat(
-            output_layer,
-            tmp_path,
-            "UTF-8",
-            output_layer.crs(),
-            "GeoJSON"
-        )
+        err_code, err_msg = compat_write_vector(output_layer, tmp_path, "GeoJSON")
 
-        if isinstance(write_result, tuple):
-            err_code = write_result[0]
-            err_msg = write_result[1] if len(write_result) > 1 else ""
-        else:
-            err_code = write_result
-            err_msg = ""
-
-        if err_code != QgsVectorFileWriter.NoError:
+        if err_code != QgsVectorFileWriter.WriterError.NoError:
             return None, f"Fallback GeoJSON write failed (code={err_code}): {err_msg}"
 
         file_layer = QgsVectorLayer(tmp_path, "Split Parts", "ogr")
@@ -2797,7 +2960,7 @@ class PolygonSplitter:
         if added_file is None or not added_file.isValid():
             return None, f"Fallback file layer could not be added: {tmp_path}"
 
-        self._log(f"Fallback output layer added from temporary file: {tmp_path}", Qgis.Warning)
+        self._log(f"Fallback output layer added from temporary file: {tmp_path}", Qgis.MessageLevel.Warning)
         return added_file, f"Output added via fallback file: {tmp_path}"
 
     def _create_temporary_output_layer(self, source_layer, parts_by_feature,
@@ -2811,16 +2974,16 @@ class PolygonSplitter:
 
         provider = temp_layer.dataProvider()
         provider.addAttributes([
-            QgsField("source_fid", QVariant.LongLong),
-            QgsField("part_id", QVariant.Int),
-            QgsField("area_val", QVariant.Double),
-            QgsField("area_txt", QVariant.String),
+            compat_field("source_fid", "longlong"),
+            compat_field("part_id", "int"),
+            compat_field("area_val", "double"),
+            compat_field("area_txt", "string"),
         ])
         temp_layer.updateFields()
 
         if da.willUseEllipsoid():
             area_factor = QgsUnitTypes.fromUnitToUnitFactor(
-                QgsUnitTypes.AreaSquareMeters, project_unit
+                AREA_SQUARE_METERS, project_unit
             )
         else:
             area_factor = QgsUnitTypes.fromUnitToUnitFactor(crs_area_unit, project_unit)
@@ -2870,7 +3033,7 @@ class PolygonSplitter:
 
     def start_split(self, mode):
         try:
-            self._log(f"start_split called (mode={mode})", Qgis.Info, to_bar=True)
+            self._log(f"start_split called (mode={mode})", Qgis.MessageLevel.Info, to_bar=True)
             # Defensive cleanup before a new run.
             self._clear_global_preview_bands()
             self._run_split(mode)
@@ -2878,9 +3041,9 @@ class PolygonSplitter:
             QMessageBox.critical(None, "Equalyzer Error", str(e))
 
     def _run_split(self, mode):
-        self._log(f"Entered _run_split (mode={mode})", Qgis.Info, to_bar=True)
+        self._log(f"Entered _run_split (mode={mode})", Qgis.MessageLevel.Info, to_bar=True)
         layer = self.iface.activeLayer()
-        if not layer or layer.type() != QgsMapLayer.VectorLayer:
+        if not layer or layer.type() != LAYER_VECTOR:
             raise Exception("Please select a vector layer first.")
 
         if layer.selectedFeatureCount() == 0:
@@ -2890,7 +3053,7 @@ class PolygonSplitter:
         polygon_features = [
             f for f in selected_features
             if f.geometry() is not None
-            and f.geometry().type() == QgsWkbTypes.PolygonGeometry
+            and f.geometry().type() == GEOM_POLYGON
         ]
         if not polygon_features:
             raise Exception("No polygon features found in the selection.")
@@ -2904,14 +3067,14 @@ class PolygonSplitter:
         unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)
 
         crs_distance_unit = layer.crs().mapUnits()
-        if crs_distance_unit == QgsUnitTypes.DistanceMeters:
-            crs_area_unit = QgsUnitTypes.AreaSquareMeters
-        elif crs_distance_unit == QgsUnitTypes.DistanceFeet:
-            crs_area_unit = QgsUnitTypes.AreaSquareFeet
-        elif crs_distance_unit == QgsUnitTypes.DistanceDegrees:
-            crs_area_unit = QgsUnitTypes.AreaSquareDegrees
+        if crs_distance_unit == DISTANCE_METERS:
+            crs_area_unit = AREA_SQUARE_METERS
+        elif crs_distance_unit == DISTANCE_FEET:
+            crs_area_unit = AREA_SQUARE_FEET
+        elif crs_distance_unit == DISTANCE_DEGREES:
+            crs_area_unit = AREA_SQUARE_DEGREES
         else:
-            crs_area_unit = QgsUnitTypes.AreaSquareMeters
+            crs_area_unit = AREA_SQUARE_METERS
 
         # Show the preview dialog
         dlg = SplitPreviewDialog(
@@ -2940,7 +3103,7 @@ class PolygonSplitter:
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
-        self._log("Split dialog opened (non-blocking mode).", Qgis.Info, to_bar=True)
+        self._log("Split dialog opened (non-blocking mode).", Qgis.MessageLevel.Info, to_bar=True)
 
     def _on_split_dialog_finished(self, dlg):
         if dlg in self._active_split_dialogs:
@@ -2956,7 +3119,7 @@ class PolygonSplitter:
             return
         setattr(dlg, "_equalyzer_apply_handled", True)
 
-        self._log("Apply callback entered.", Qgis.Info, to_bar=True)
+        self._log("Apply callback entered.", Qgis.MessageLevel.Info, to_bar=True)
 
         try:
             params = dlg.get_parameters()
@@ -2981,7 +3144,7 @@ class PolygonSplitter:
             QMessageBox.warning(None, "Equalyzer", "No direction line was drawn. Operation cancelled.")
             return
 
-        self._log("Apply started. Computing split parts…", Qgis.Info, to_bar=True)
+        self._log("Apply started. Computing split parts…", Qgis.MessageLevel.Info, to_bar=True)
 
         # Deterministic apply path: always recompute from final dialog params.
         # This avoids any dependency on preview-cache/dialog lifecycle ordering.
@@ -2993,7 +3156,7 @@ class PolygonSplitter:
         self._log(
             f"Apply direction diagnostics -> drawn: {direction_angle:.2f}°, "
             f"effective cut: {direction_angle:.2f}° (parallel)",
-            Qgis.Info
+            Qgis.MessageLevel.Info
         )
 
         engine = _SplitEngine(
@@ -3025,11 +3188,11 @@ class PolygonSplitter:
             QMessageBox.warning(None, "Equalyzer", "No parts were produced. Check your parameters.")
             return
 
-        self._log(f"Split computation produced {len(all_parts)} part(s).", Qgis.Info, to_bar=True)
+        self._log(f"Split computation produced {len(all_parts)} part(s).", Qgis.MessageLevel.Info, to_bar=True)
         if method_fallback_messages:
             self._log(
                 "Strict split fallback used: " + " ".join(method_fallback_messages),
-                Qgis.Warning,
+                Qgis.MessageLevel.Warning,
                 to_bar=True
             )
 
@@ -3042,10 +3205,10 @@ class PolygonSplitter:
 
         provider = output_layer.dataProvider()
         provider.addAttributes([
-            QgsField("source_fid", QVariant.LongLong),
-            QgsField("part_id", QVariant.Int),
-            QgsField("area_val", QVariant.Double),
-            QgsField("area_txt", QVariant.String),
+            compat_field("source_fid", "longlong"),
+            compat_field("part_id", "int"),
+            compat_field("area_val", "double"),
+            compat_field("area_txt", "string"),
         ])
         output_layer.updateFields()
 
@@ -3056,11 +3219,11 @@ class PolygonSplitter:
             output_layer.id() in QgsProject.instance().mapLayers()
         )
         if memory_added:
-            self._log("Output layer inserted into project. Writing features…", Qgis.Info, to_bar=True)
+            self._log("Output layer inserted into project. Writing features…", Qgis.MessageLevel.Info, to_bar=True)
         else:
             self._log(
                 "Output layer could not be inserted before write; will use fallback path if needed.",
-                Qgis.Warning,
+                Qgis.MessageLevel.Warning,
                 to_bar=True
             )
 
@@ -3069,7 +3232,7 @@ class PolygonSplitter:
 
         if da.willUseEllipsoid():
             area_factor = QgsUnitTypes.fromUnitToUnitFactor(
-                QgsUnitTypes.AreaSquareMeters, project_unit
+                AREA_SQUARE_METERS, project_unit
             )
         else:
             area_factor = QgsUnitTypes.fromUnitToUnitFactor(crs_area_unit, project_unit)
@@ -3095,7 +3258,7 @@ class PolygonSplitter:
                     feat.setAttribute("area_txt", f"{area_display:.4f} {unit_abbrev}")
                     features_to_add.append(feat)
 
-        self._log(f"Prepared {len(features_to_add)} feature(s) for output write.", Qgis.Info, to_bar=True)
+        self._log(f"Prepared {len(features_to_add)} feature(s) for output write.", Qgis.MessageLevel.Info, to_bar=True)
 
         if features_to_add:
             add_result = provider.addFeatures(features_to_add)
@@ -3107,7 +3270,7 @@ class PolygonSplitter:
             add_ok = False
             self._log(
                 "Primary output prepared 0 features; forcing emergency fallback path.",
-                Qgis.Warning
+                Qgis.MessageLevel.Warning
             )
 
         output_layer.updateExtents()
@@ -3116,10 +3279,10 @@ class PolygonSplitter:
         if not add_ok and features_to_add:
             self._log(
                 f"Provider addFeatures returned failure. Provider error: {provider.lastError()}",
-                Qgis.Warning
+                Qgis.MessageLevel.Warning
             )
         elif not features_to_add:
-            self._log("Skipped provider.addFeatures because feature list is empty.", Qgis.Warning)
+            self._log("Skipped provider.addFeatures because feature list is empty.", Qgis.MessageLevel.Warning)
 
         self._log(f"Output layer feature count after write: {added_count}")
 
@@ -3128,7 +3291,7 @@ class PolygonSplitter:
             detail = provider.lastError() if provider.lastError() else "Unknown provider error"
             self._log(
                 f"Primary output write produced zero features ({detail}); trying emergency temp layer.",
-                Qgis.Warning,
+                Qgis.MessageLevel.Warning,
                 to_bar=True
             )
 
@@ -3153,12 +3316,12 @@ class PolygonSplitter:
                 return
             added_count = result_layer.featureCount()
             memory_added = result_layer is not None and result_layer.isValid()
-            self._log(fallback_note, Qgis.Warning, to_bar=True)
+            self._log(fallback_note, Qgis.MessageLevel.Warning, to_bar=True)
 
         if added_count > 0 and not memory_added:
             self._log(
                 "Memory layer add after write failed; trying fallback loader.",
-                Qgis.Warning,
+                Qgis.MessageLevel.Warning,
                 to_bar=True
             )
             result_layer, fallback_note = self._add_output_layer_with_fallback(output_layer)
@@ -3175,7 +3338,7 @@ class PolygonSplitter:
                     )
                     return
                 fallback_note = temp_note
-                self._log(fallback_note, Qgis.Warning, to_bar=True)
+                self._log(fallback_note, Qgis.MessageLevel.Warning, to_bar=True)
 
         # Add area labels
         label_settings = QgsPalLayerSettings()
@@ -3184,7 +3347,7 @@ class PolygonSplitter:
         label_settings.fieldName = "area_txt"
         text_format = QgsTextFormat()
         text_format.setSize(10)
-        text_format.setColor(Qt.darkRed)
+        text_format.setColor(QColor(Qt.GlobalColor.darkRed))
         label_settings.setFormat(text_format)
         result_layer.setLabeling(QgsVectorLayerSimpleLabeling(label_settings))
         result_layer.setLabelsEnabled(True)
@@ -3206,5 +3369,5 @@ class PolygonSplitter:
         if fallback_note:
             result_msg += f"\n\n{fallback_note}"
 
-        self._log("Apply completed. Output layer created.", Qgis.Info, to_bar=True)
+        self._log("Apply completed. Output layer created.", Qgis.MessageLevel.Info, to_bar=True)
         QMessageBox.information(None, "Equalyzer – Done", result_msg)

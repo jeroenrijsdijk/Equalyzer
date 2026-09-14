@@ -1,8 +1,9 @@
 [general]
 name=Equalyzer - Split Polygons into Equal Areas or Parts
 qgisMinimumVersion=3.16
+qgisMaximumVersion=4.99
 description=Splits polygons into equal areas or equal parts easily
-version=1.4.5
+version=1.5.0
 author=Abel Koszeghy
 email=abelke@gmail.com
 
@@ -12,7 +13,8 @@ homepage=https://github.com/danzig666/Equalyzer
 tracker=https://github.com/danzig666/Equalyzer/issues
 repository=https://github.com/danzig666/Equalyzer
 
-changelog = 1.4.5 Added strict straight-cut splitting as the primary path for area and count modes, preserving original polygon boundaries except at real cut intersections. Falls back to the connected splitter when strict cuts cannot keep connected single-polygon parts, and now reports fallback use in Preview, Apply, and the QGIS message log. Updated splitGeometry calls for QGIS 3/4 compatibility.
+changelog = 1.5.0 QGIS 4 (Qt6) compatibility while keeping QGIS 3 (Qt5) support. All Qt and QGIS enums now use their fully scoped, version-neutral spelling. Version-dependent details (QgsField type argument, snapping configuration, unit/geometry enum names, vector file writing, QAction import location) are isolated in one compatibility block at the top of polygon_splitter.py. Snapping setup can no longer break the direction tool. Added qgisMaximumVersion=4.99 so QGIS 4 will load the plugin.
+  1.4.5 Added strict straight-cut splitting as the primary path for area and count modes, preserving original polygon boundaries except at real cut intersections. Falls back to the connected splitter when strict cuts cannot keep connected single-polygon parts, and now reports fallback use in Preview, Apply, and the QGIS message log. Updated splitGeometry calls for QGIS 3/4 compatibility.
   1.4.2 Added saved Precision setting for connected concave splitting. Higher precision uses finer strip graphs, multiple seed offsets and more rebalancing iterations; dialog geometry is saved/restored through QGIS settings.
   1.4.1 Removed unsupported QgsGeometry.boundary() call for older QGIS versions. Uses bbox-overlap plus geometry distance for strip adjacency. Evaluates multiple strip resolutions and keeps the best balanced exact-count result.
   1.4.0 Replaced count-mode concave splitting with connected graph partitioning. Produces exactly the requested number of connected output polygons. Added boundary-node rebalancing to improve equal-area results on irregular shapes.
