@@ -4,7 +4,7 @@ Equalyzer is a QGIS Python plugin for splitting selected polygon features into e
 
 ## Requirements
 
-- QGIS 3.16 or newer, now suitabel for 4.x
+- QGIS 3.16 or newer, now suitable for 4.x
 - A polygon or multipolygon vector layer
 - A projected CRS is recommended for accurate area work
 
