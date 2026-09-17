@@ -172,7 +172,7 @@ def plan_bays(length, depth, bay_length=DEFAULT_BAY_LENGTH,
 
 def convex_hull(points):
     """Andrew's monotone chain. Returns the hull counter-clockwise, open."""
-    pts = sorted(set((round(x, 9), round(y, 9)) for x, y in points))
+    pts = sorted(set((float(x), float(y)) for x, y in points))
     if len(pts) < 3:
         return pts
 

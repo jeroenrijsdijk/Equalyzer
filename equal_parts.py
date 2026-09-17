@@ -235,7 +235,7 @@ def solve_cuts(profile, targets):
 # QGIS-facing part
 # ---------------------------------------------------------------------------
 
-from qgis.core import QgsGeometry, QgsPointXY, QgsRectangle, QgsWkbTypes  # noqa: E402
+from qgis.core import QgsGeometry, QgsRectangle, QgsWkbTypes  # noqa: E402
 
 
 class EqualPartsResult:

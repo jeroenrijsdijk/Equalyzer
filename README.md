@@ -1,134 +1,133 @@
 # Equalyzer
 
-Equalyzer is a QGIS Python plugin for splitting selected polygon features into equal-area parts or into a requested number of parts.
+A QGIS plugin that splits polygons into equal parts, into parts of a given
+area, or into parking bays. Runs on QGIS 3.16+ and QGIS 4.
 
-## Requirements
+![Equalyzer in action](screencapture.gif)
 
-- QGIS 3.16 or newer, now suitable for 4.x
-- A polygon or multipolygon vector layer
-- A projected CRS is recommended for accurate area work
+## Install
 
-## Usage
+Download the repository as a ZIP and use *Plugins ▸ Manage and Install
+Plugins ▸ Install from ZIP*. GitHub's download unpacks to a folder named
+`Equalyzer-main`; that works as it is, or rename it to `Equalyzer` first.
 
-1. Select one or more polygon features is optional
-2. Start either `Equal Area` or `Equal Parts` or 'parking bay' from the plugin menu or toolbar.
-3. Draw a direction line on the map. Cut lines are created parallel to this line.
-4. Optionally pick the side to start from.
-5. Set the target area or number of parts.
-6. Use `Preview` to inspect the result, then `Apply` to create the output layer.
+## Three modes
 
-The plugin creates a new temporary layer with these fields:
+### Equal parts
 
-- `source_fid`
-- `part_id`
-- `area_val`
-- `area_txt`
-- and copies  all  fields from source polygon
+1. Start *Split into Equal Parts*. Select a polygon first, or select nothing
+   and let the direction line pick one (see below).
+2. Draw a direction line on the map. Cuts run parallel to it.
+3. Optionally click a start side; parts are numbered from there.
+4. Enter the number of parts, preview, apply.
 
+The parts have exactly equal area, to within rounding.
 
+### Equal areas
 
+The same, with a target area per part instead of a count. The last part
+takes the remainder.
 
-## Splitting into N equal parts (since 1.6.0)
+### Parking bays
 
-The cut positions are computed from the polygon's exact cumulative-area
-profile: after rotating so the cuts are horizontal, the width of a
-cross-section is linear between consecutive vertex ordinates, so the area
-below a cut is piecewise quadratic and each cut is one closed-form solve.
-The parts themselves are obtained by intersecting the polygon with band
-polygons, which tile the plane, so the parts always add up to the original.
+Select the strips, or select nothing and draw a line over the strip you
+mean, then press *Split into Parking Bays*. There is nothing to draw or
+type after that:
 
-If the project measures on the ellipsoid, the cuts are refined with a few
-Newton steps using dA/dy = width(y).
+- each strip is measured along its own axis, so a whole selection can be
+  cut in one go
+- the short side decides the orientation: a strip about 2.5 m deep holds
+  bays head to tail and is cut every 5 m; a strip about 5 m deep holds them
+  side by side and is cut every 2.5 m
+- the count follows from the length, with a minimum bay size: a 17.86 m
+  strip becomes three bays of 5.95 m, not four of 4.47 m
+- the strip is then divided into that many equal parts, so drawing slack
+  is spread out instead of left as a sliver
 
-Parts that would consist of several separate pieces (a concave polygon cut
-across its arms) are handed to the older connected partitioner instead, and
-the plugin says so in the result message.
+The dialog shows the plan per strip before anything is created and flags a
+length that is not close to a whole number of bays, a depth that matches
+neither bay size (you pick the orientation yourself), and a strip that is
+too curved for a straight axis. Bay sizes and minimums are configurable and
+remembered.
 
-Run `test_equal_parts.py` from the QGIS Python console to check the engine
-against a set of synthetic polygons without touching your own data.
+## Picking a polygon with the line
 
-## Choosing the polygon (since 1.6.1)
-
-Selecting a polygon first is optional. If nothing is selected when you start
-Equalyzer, draw the direction line across the polygon you want to split: the
+In every mode, if nothing is selected when you draw the direction line, the
 polygon the line runs through over the greatest length is selected in the
 layer, so you can see what was picked before previewing. Ties go to the
-smaller polygon. If the line crosses nothing, Equalyzer falls back to the
-polygon containing the first click and otherwise asks you to draw again.
+smaller polygon. An existing selection always wins.
 
-An existing selection always wins, so splitting several polygons at once with
-one direction keeps working as before.
+## Output
 
-## Parking bays (since 1.7.0)
+Parts go to a memory layer named `Split Parts – <source layer>`. A later
+split of the same source layer is appended to it, so a session's work stays
+in one place. The layer is recognised by a custom property, so renaming it
+is fine.
 
-A bay is about 5 m long and 2.5 m wide, so the short side of a strip says which
-of the two runs along its length: a strip about 2.5 m deep holds bays head to
-tail and is cut every 5 m, a strip about 5 m deep holds them side by side and is
-cut every 2.5 m. The length cannot decide this on its own, because a multiple of
-5 is also a multiple of 2.5.
+Each part gets `source_fid`, `part_id` (numbered per source polygon),
+`area_val` and `area_txt`, followed by a copy of every attribute of the
+source feature. A source field whose name clashes with one of those four is
+prefixed with `src_`.
 
-Select the strips and press "Split into Parking Bays", or press it with nothing
-selected and draw a line over the strip you mean: the line only points at the
-polygon, the cut direction still comes from the strip itself. Each strip is measured
-with its own oriented minimum bounding box, so the cut direction comes from the
-strip itself and a whole selection can be processed at once. The number of bays is not simply round(length / spacing): a 17.86 m strip is
-3.57 bays of 5 m, and four bays of 4.47 m is not something anyone paints. Both
-neighbouring counts are considered, and a count whose bays land between the
-minimum (4.80 m along the car, 2.40 m across it, both configurable) and 1.5
-times the nominal size wins; the nominal size only decides between two
-acceptable counts. If neither fits, the size closest to nominal is used and the
-dialog says so. The strip is then divided into that many equal parts, so a few
-centimetres of drawing slack are spread out instead of left as a sliver.
+In parking-bay mode you can instead delete the original, or replace it in
+the source layer by its bays. Adding the bays and removing the strip happen
+inside one named edit command, so a single Ctrl+Z undoes the whole thing.
+If the layer was already in edit mode the change joins that session and you
+save it yourself; otherwise Equalyzer opens a session and commits it. The
+choice is remembered and defaults to the safe one.
 
-The dialog shows the plan per strip before anything is created, and flags:
+After a split the layer you split is the active layer again.
 
-- a length that is not close to a whole number of bays
-- a depth that matches neither a bay width nor a bay length (you pick the
-  orientation yourself)
-- a strip that fills much less than its bounding rectangle, which usually means
-  it is curved; draw the direction line by hand for those
+## Coordinate systems
 
-Bay sizes are configurable and remembered between sessions.
+Angles and distances cannot be computed in degrees: at 52° north a degree
+of longitude covers 62 % of the ground distance of a degree of latitude, so
+a right angle in the coordinates is not a right angle on the ground. For a
+layer in a geographic CRS, Equalyzer transforms each feature into the UTM
+zone of the data, measures and cuts it there, and transforms the parts
+back. Projected layers such as RD New are used as they are. Areas are
+always reported in square metres, converted to the project's area unit.
 
-## Geographic CRS
+## How the splitting works
 
-Angles and distances are meaningless in degrees: at 52 degrees north a degree of
-longitude covers 62% of the ground distance of a degree of latitude, so a shape
-that is rectangular on the ground is sheared in the coordinates. A perpendicular
-computed there lands up to 25 degrees off, depending on the orientation of the
-strip.
+After rotating the polygon so the cuts are horizontal, the width of a
+cross-section is linear between consecutive vertex heights, so the area
+below a cut is piecewise quadratic and every cut position is one
+closed-form solve. Parts are produced by intersecting the polygon with band
+polygons, which tile the plane, so they always add up to the original. If
+the project measures on the ellipsoid, the cuts are refined with a few
+Newton steps using dA/dy = width(y).
 
-When the layer is in a geographic CRS, Equalyzer therefore transforms each
-feature into the UTM zone of the data, measures and cuts it there, and
-transforms the parts back. Projected layers such as RD New are used as they are.
+A part that would consist of several separate pieces (a concave polygon cut
+across its arms) is handed to a connected partitioner instead, and the
+result message says so. For parking strips the axis is the direction that
+makes the strip narrowest, found on the polygon's convex hull.
 
-## Output layer
+Both engines have pure-Python cores in `equal_parts.py` and `parking.py`.
 
-Parts are written to a memory layer named "Split Parts - <source layer>". A
-later split of the same source layer is appended to that layer rather than
-creating a new one, so a session's work collects in one place. The layer is
-recognised by a custom property, so renaming it is fine; it is tied to the
-source layer because it carries that layer's fields.
+## Tests
 
-Each part gets source_fid, part_id (numbered per source polygon), area_val and
-area_txt, followed by a copy of every attribute of the source feature. A source
-field whose name would clash with one of those four is prefixed with src_.
+From the plugin folder:
 
-## Replacing the original
+    python -m unittest discover -s tests -v
 
-Drawing a strip into the real parking layer and then splitting it leaves the
-strip behind. The bay dialog therefore offers three outcomes:
+This needs shapely, which serves as ground truth, and does not need QGIS.
+Inside QGIS, `tests/qgis_console_check.py` runs the real engine on synthetic
+polygons; instructions are at the top of that file.
 
-- collect the bays in the Split Parts layer (the original stays)
-- collect them there and delete the original polygon
-- replace the original in the source layer by its bays
+## Diagnostics
 
-In the third case the bays are written into the source layer itself and inherit
-every attribute of the strip, except fields the provider owns such as a
-GeoPackage fid. Adding the bays and removing the strip happen inside one named
-edit command, so a single Ctrl+Z undoes the whole thing. If the layer was
-already in edit mode the change joins that session and you save it yourself;
-otherwise Equalyzer opens a session and commits it.
+Every step of a split can be logged to the *Equalyzer* tab of the Log
+Messages panel. Enable it from the QGIS Python console and reload the
+plugin:
 
-The choice is remembered. It defaults to the first option, because the other two
-delete from a real data file.
+    QSettings().setValue("Equalyzer/debug", True)
+
+Errors always land in that panel with a full traceback.
+
+## Credits and licence
+
+Originally written by Abel Koszeghy
+(https://github.com/danzig666/Equalyzer). This fork rewrote the splitting
+engine, added parking-bay mode and QGIS 4 support. MIT licence, see
+`LICENSE`.

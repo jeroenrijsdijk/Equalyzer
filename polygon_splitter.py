@@ -1,155 +1,33 @@
 """
-Equalyzer - Split Polygons into Equal Areas or Parts
-Version 1.12.0
-Author: Abel Koszeghy
+Equalyzer - split polygons into equal areas, equal parts, or parking bays.
 
-Improvements in 1.5.0:
-- Runs on QGIS 4 (Qt6) as well as QGIS 3 (Qt5)
-- All Qt and QGIS enums use their fully scoped, version-neutral spelling
-- QgsField creation, snapping configuration and vector file writing go
-  through a single compatibility layer near the top of this file
+QGIS plugin, runs on QGIS 3.16+ (Qt5) and QGIS 4 (Qt6).
 
-Improvements in 1.4.5:
-- Reworked target-area mode as a weighted connected partition
-- Target-area mode now produces N full target-sized parts plus one remainder part
-  without falling back to equal-count semantics or emitting tiny intermediate slivers
+Layout of this file
+-------------------
+  compatibility layer   QGIS 3 / QGIS 4 differences, all in one place
+  helpers               feature picking, metric work frame, output fields
+  map tools             LineDrawTool, PointPickTool
+  SplitPreviewDialog    equal-parts and equal-area modes
+  BayPlanDialog         parking-bay mode
+  _SplitEngine          the splitting itself
+  PolygonSplitter       the plugin: toolbar actions and the apply path
 
-Improvements in 1.4.4:
-- Fixed target-area mode so it creates repeated target-sized connected parts
-  plus a final leftover part, instead of converting the target area into equal-count mode
+The exact equal-parts slicer lives in equal_parts.py and the parking-bay
+planning in parking.py; both have pure-Python cores that are tested without
+QGIS (see tests/).
 
-Improvements in 1.4.2:
-- Added saved Precision setting for concave connected splitting
-- Higher precision uses finer strip graphs and more rebalancing iterations
-- Saves and restores the dialog window geometry with QGIS settings
-
-Improvements in 1.4.1:
-- Removed unsupported QgsGeometry.boundary() call for older QGIS versions
-- Uses bbox-overlap + QgsGeometry.distance() for strip adjacency
-- Evaluates multiple strip resolutions and keeps the best balanced exact-count result
-
-Improvements in 1.4.0:
-- Replaced count-mode concave splitting with connected graph partitioning
-- Produces exactly the requested number of connected output polygons
-- Added boundary-node rebalancing to improve equal-area results on irregular shapes
-
-Improvements in 1.2.17:
-- Reworked split engine for better concave-polygon handling using
-  cumulative-area slicing in rotated space
-- Reduced topology instability from iterative remainder differencing
-
-Improvements in 1.2.16:
-- Apply is now enabled as soon as a valid direction line is set
-  (Preview is optional)
-- Clearing preview no longer disables Apply when direction is still available
-
-Improvements in 1.2.15:
-- Replaced blocking apply flow with signal-driven non-blocking dialog handling
-  to bypass exec_ deadlock on Apply
-- Split/output pipeline now runs from accepted callback with explicit
-  "Apply callback entered" marker
-
-Improvements in 1.2.14:
-- Fixed Apply deadlock path by removing preview-band scene cleanup from dialog
-  accept/close lifecycle (cleanup is deferred to plugin-level run boundaries)
-- Added explicit marker after dialog returns from exec_ to confirm pipeline
-  continuation
-
-Improvements in 1.2.13:
-- Added hard runtime markers (plugin load, Apply click, split entry) to
-  diagnose silent Apply failures
-- Made dialog Apply path exception-safe so preview cleanup cannot block
-  execution of the split pipeline
-
-Improvements in 1.2.12:
-- Added visible apply/output diagnostics to QGIS message bar
-- Restored MultiPolygon output workflow and normalized all written geometries
-  to multipolygon-safe parts
-- Output layer is now inserted into project before writing for deterministic
-  visibility on Apply
-
-Improvements in 1.2.11:
-- Removed early-terminate apply path that could bypass emergency fallback
-  when primary output feature list was empty
-- Forced zero-feature apply runs through emergency temporary memory-layer
-  creation path
-
-Improvements in 1.2.9:
-- Fixed oblique-direction cut orientation by aligning with QGIS clockwise
-  rotation semantics
-- Added explicit preview cleanup on dialog OK (accept)
-- Simplified output layer schema for robust memory-layer feature insertion
-
-Improvements in 1.2.10:
-- Added emergency temporary memory-layer fallback if regular output add/write
-  path fails
-- Switched primary output geometry to Polygon for broader provider compatibility
-
-Improvements in 1.2.8:
-- Apply flow now always recomputes split from final dialog parameters
-  (independent from preview cache/lifecycle)
-- Output memory layer is written before adding to project for deterministic
-  creation behavior
-- Added explicit direction/cut angle diagnostics to log
-
-Improvements in 1.2.7:
-- Aligned cut orientation with drawn direction line (cuts parallel to line)
-- Strengthened memory-layer output creation flow (layer added deterministically)
-- Expanded global preview cleanup hooks for project open/new/clear
-
-Improvements in 1.2.6:
-- Apply now reuses the exact geometries computed in preview
-- Improved split robustness for opposite sweep directions
-- Hardened output-memory-layer writing for mixed polygon/multipolygon cases
-- Added global preview-rubber-band cleanup (including project reset/new project)
-
-Improvements in 1.2.5:
-- Added robust output-layer insertion diagnostics to QGIS log
-- Added fallback output creation via temporary GeoJSON when memory-layer
-  insertion fails
-- Added clearer user-facing error messages for write/add failures
-
-Improvements in 1.2.4:
-- Fixed apply/output generation by using one consistent split computation
-  path for writing features
-- Improved equal-area splitting so it does not stop too early
-- Added explicit output-write failure checks and user feedback
-
-Improvements in 1.2.3:
-- Fixed cut orientation math so split lines are perpendicular to the
-  drawn direction line
-- Added validation for degenerate/too-short direction lines
-- Improved direction status text to show both drawn direction and
-  effective cut angle
-
-Improvements in 1.2.2:
-- Reworked interactive map picking to avoid nested event loops
-- Fixed Windows focus/deadlock behavior where QGIS could freeze after
-  selecting the second direction-line point
-
-Improvements in 1.2.1:
-- Fixed freeze/unresponsive behavior after selecting the second
-  direction-line point
-
-Improvements in 1.2:
-- Fixed splitting direction logic (cuts are now perpendicular to the drawn line)
-- Fixed CRS handling (transform always defined, applied consistently)
-- Fixed starting side logic using projected coordinates in rotated space
-- Added interactive preview dialog with rubber band display
-- Preview shows split polygons with area labels
-- Improved binary search precision (50 iterations)
-- Fixed leftover merging threshold
-- Better error handling and user feedback
+Originally written by Abel Koszeghy (MIT). See metadata.txt for the changelog.
 """
 
 from qgis.PyQt.QtCore import Qt, QVariant, QSettings
 from qgis.PyQt.QtWidgets import (
-    QMessageBox, QInputDialog, QDialog, QVBoxLayout,
+    QMessageBox, QDialog, QVBoxLayout,
     QHBoxLayout, QLabel, QPushButton, QDoubleSpinBox, QSpinBox,
-    QGroupBox, QFormLayout, QDialogButtonBox, QSizePolicy, QFrame,
+    QGroupBox, QFormLayout, QDialogButtonBox, QFrame,
     QComboBox
 )
-from qgis.PyQt.QtGui import QIcon, QColor, QFont
+from qgis.PyQt.QtGui import QIcon, QColor
 
 # QAction lives in QtWidgets on Qt5 and in QtGui on Qt6.
 try:
@@ -182,6 +60,7 @@ from .parking import (
 )
 import math
 import os
+import traceback
 import tempfile
 import uuid
 
@@ -270,9 +149,19 @@ LAYER_VECTOR = _resolve_enum(
     (QgsMapLayer, None, "VectorLayer"),
 )
 
-# Diagnostics: writes to the "Equalyzer" tab of the QGIS Log Messages panel.
-# Set to False once the splitting problem is understood.
-DEBUG = True
+# Diagnostics go to the "Equalyzer" tab of the Log Messages panel. Off by
+# default; switch on from the QGIS Python console with
+#     QSettings().setValue("Equalyzer/debug", True)
+# and reload the plugin.
+def _debug_enabled():
+    try:
+        value = QSettings().value("Equalyzer/debug", False)
+        return str(value).lower() in ("true", "1", "yes")
+    except Exception:
+        return False
+
+
+DEBUG = _debug_enabled()
 
 
 _dbg_counters = {}
@@ -340,6 +229,29 @@ def compat_snapping_enums():
         (QgsTolerance, None, "Pixels"),
     )
     return mode, vertex, unit
+
+
+def crs_area_unit_for(layer):
+    """Area unit matching the layer's map units, for planar measurements."""
+    unit = layer.crs().mapUnits()
+    if unit == DISTANCE_FEET:
+        return AREA_SQUARE_FEET
+    if unit == DISTANCE_DEGREES:
+        return AREA_SQUARE_DEGREES
+    return AREA_SQUARE_METERS
+
+
+def plugin_version():
+    """Version string from metadata.txt, so it is stated in one place only."""
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metadata.txt")
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("version="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return "unknown"
 
 
 def pick_feature_under_line(layer, points):
@@ -789,7 +701,7 @@ class SplitPreviewDialog(QDialog):
             self.area_spin.setSuffix(f"  {self.unit_abbrev}")
             self.area_spin.setSingleStep(100.0)
             self.area_spin.valueChanged.connect(self._clear_preview)
-            param_layout.addRow(f"Target area per part:", self.area_spin)
+            param_layout.addRow("Target area per part:", self.area_spin)
         else:
             self.parts_spin = QSpinBox()
             self.parts_spin.setRange(2, 10000)
@@ -1245,7 +1157,7 @@ class SplitPreviewDialog(QDialog):
             summary += f"\n… and {total_parts - 20} more"
         fallback_messages = getattr(splitter, "fallback_messages", [])
         if fallback_messages:
-            summary += "\n\nFallback used:\n" + "\n".join(fallback_messages[:3])
+            summary += "\n\nNotes:\n" + "\n".join(fallback_messages[:3])
         self.preview_status_label.setText(summary)
         self.apply_btn.setEnabled(True)
 
@@ -1660,19 +1572,6 @@ class _SplitEngine:
                 parts_by_feature.append((feature, parts))
 
         return parts_by_feature
-
-    def compute_parts(self):
-        """Return list of QgsGeometry parts (all polygons, all features)."""
-        parts_by_feature = self.compute_parts_by_feature()
-        all_parts = []
-        for _, parts in parts_by_feature:
-            all_parts.extend(parts)
-
-        return all_parts
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _set_direction_from_points(self, points):
         """Point the cut lines along the given pair of points."""
@@ -3464,13 +3363,7 @@ class PolygonSplitter:
         self.toolbar.addAction(self.bays_action)
         self.actions.append(self.bays_action)
 
-        try:
-            iface.messageBar().pushInfo(
-                "Equalyzer",
-                f"Loaded v1.12.0 from {os.path.abspath(__file__)}"
-            )
-        except Exception:
-            pass
+        dbg(f"Equalyzer {plugin_version()} loaded from {os.path.dirname(os.path.abspath(__file__))}")
 
         if not self._signals_connected:
             try:
@@ -3557,8 +3450,9 @@ class PolygonSplitter:
             pass
 
     def _log(self, message, level=Qgis.MessageLevel.Info, to_bar=False):
+        """Log panel always; message bar for warnings, or for info when debugging."""
         QgsMessageLog.logMessage(message, "Equalyzer", level)
-        if to_bar or level in (Qgis.MessageLevel.Warning, Qgis.MessageLevel.Critical):
+        if (to_bar and DEBUG) or level in (Qgis.MessageLevel.Warning, Qgis.MessageLevel.Critical):
             try:
                 if level == Qgis.MessageLevel.Critical:
                     iface.messageBar().pushCritical("Equalyzer", message)
@@ -3769,7 +3663,7 @@ class PolygonSplitter:
         crs_authid = source_layer.crs().authid()
         temp_layer = QgsVectorLayer(f"MultiPolygon?crs={crs_authid}", "Split Parts (temp)", "memory")
         if not temp_layer.isValid():
-            return None, "Emergency temp layer could not be created"
+            return None, "Fallback layer could not be created"
 
         provider = temp_layer.dataProvider()
         temp_fields, temp_attribute_map = build_output_fields(source_layer)
@@ -3813,23 +3707,34 @@ class PolygonSplitter:
                     feats.append(f)
 
         if not feats:
-            return None, "Emergency temp layer had no valid features to write"
+            return None, "Fallback layer had no valid features to write"
 
         add_res = provider.addFeatures(feats)
         add_ok = bool(add_res[0]) if isinstance(add_res, tuple) else bool(add_res)
         temp_layer.updateExtents()
         if not add_ok or temp_layer.featureCount() == 0:
-            return None, f"Emergency temp layer write failed: {provider.lastError()}"
+            return None, f"Fallback layer write failed: {provider.lastError()}"
 
         added = QgsProject.instance().addMapLayer(temp_layer)
         if added is None or not added.isValid():
-            return None, "Emergency temp layer addMapLayer failed"
+            return None, "Fallback layer addMapLayer failed"
 
-        return added, "Output added via emergency temporary memory layer"
+        return added, "Output added via fallback memory layer"
 
     # ------------------------------------------------------------------
     # Entry point
     # ------------------------------------------------------------------
+
+    def _report_error(self, what, exc):
+        """Show the message; put the traceback where it can be found later."""
+        QgsMessageLog.logMessage(
+            f"{what}: {exc}\n{traceback.format_exc()}", "Equalyzer",
+            Qgis.MessageLevel.Critical
+        )
+        QMessageBox.critical(
+            None, "Equalyzer Error",
+            f"{what}:\n{exc}\n\nDetails are in the Log Messages panel, tab Equalyzer."
+        )
 
     def start_split(self, mode):
         try:
@@ -3838,14 +3743,14 @@ class PolygonSplitter:
             self._clear_global_preview_bands()
             self._run_split(mode)
         except Exception as e:
-            QMessageBox.critical(None, "Equalyzer Error", str(e))
+            self._report_error("Could not start the split", e)
 
     def start_bays(self):
         try:
             self._clear_global_preview_bands()
             self._run_bays()
         except Exception as e:
-            QMessageBox.critical(None, "Equalyzer Error", str(e))
+            self._report_error("Could not start parking-bay mode", e)
 
     def _run_bays(self):
         """Cut parking strips into bays.
@@ -3944,7 +3849,7 @@ class PolygonSplitter:
             lambda d=dlg, lyr=layer, feats=polygon_features, dist=da,
                    punit=project_unit, uabbr=unit_abbrev:
             self._on_split_dialog_accepted(
-                d, "bays", lyr, feats, dist, punit, uabbr, AREA_SQUARE_METERS
+                d, "bays", lyr, feats, dist, punit, uabbr, crs_area_unit_for(lyr)
             )
         )
         dlg.finished.connect(lambda _res, d=dlg: self._on_split_dialog_finished(d))
@@ -3978,15 +3883,7 @@ class PolygonSplitter:
         project_unit = QgsProject.instance().areaUnits()
         unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)
 
-        crs_distance_unit = layer.crs().mapUnits()
-        if crs_distance_unit == DISTANCE_METERS:
-            crs_area_unit = AREA_SQUARE_METERS
-        elif crs_distance_unit == DISTANCE_FEET:
-            crs_area_unit = AREA_SQUARE_FEET
-        elif crs_distance_unit == DISTANCE_DEGREES:
-            crs_area_unit = AREA_SQUARE_DEGREES
-        else:
-            crs_area_unit = AREA_SQUARE_METERS
+        crs_area_unit = crs_area_unit_for(layer)
 
         # Show the preview dialog
         dlg = SplitPreviewDialog(
@@ -4038,7 +3935,7 @@ class PolygonSplitter:
         try:
             params = dlg.get_parameters()
         except Exception as e:
-            QMessageBox.critical(None, "Equalyzer Error", f"Failed to read dialog parameters: {e}")
+            self._report_error("Could not read the dialog settings", e)
             return
 
         if not polygon_features:
@@ -4056,7 +3953,7 @@ class PolygonSplitter:
                 params
             )
         except Exception as e:
-            QMessageBox.critical(None, "Equalyzer Error", f"Apply callback failed: {e}")
+            self._report_error("Applying the split failed", e)
 
     def _run_split_apply_from_params(self, mode, layer, polygon_features, da,
                                      project_unit, unit_abbrev, crs_area_unit,
@@ -4111,12 +4008,8 @@ class PolygonSplitter:
             return
 
         self._log(f"Split computation produced {len(all_parts)} part(s).", Qgis.MessageLevel.Info, to_bar=True)
-        if method_fallback_messages:
-            self._log(
-                "Strict split fallback used: " + " ".join(method_fallback_messages),
-                Qgis.MessageLevel.Warning,
-                to_bar=True
-            )
+        for note in method_fallback_messages:
+            self._log(note, Qgis.MessageLevel.Info)
 
         if params.get("replace_in_source"):
             ok, state, written = self._replace_in_source_layer(layer, parts_by_feature)
@@ -4241,7 +4134,7 @@ class PolygonSplitter:
         else:
             add_ok = False
             self._log(
-                "Primary output prepared 0 features; forcing emergency fallback path.",
+                "Primary output prepared 0 features; using the fallback layer.",
                 Qgis.MessageLevel.Warning
             )
 
@@ -4262,7 +4155,7 @@ class PolygonSplitter:
         if added_count == 0:
             detail = provider.lastError() if provider.lastError() else "Unknown provider error"
             self._log(
-                f"Primary output write produced zero features ({detail}); trying emergency temp layer.",
+                f"Primary output write produced zero features ({detail}); trying the fallback layer.",
                 Qgis.MessageLevel.Warning,
                 to_bar=True
             )
@@ -4376,7 +4269,7 @@ class PolygonSplitter:
             result_msg += f"Requested parts per polygon: {int(params['target_value'])}"
 
         if method_fallback_messages:
-            result_msg += "\n\nFallback used:\n" + "\n".join(method_fallback_messages)
+            result_msg += "\n\nNotes:\n" + "\n".join(method_fallback_messages)
 
         if fallback_note:
             result_msg += f"\n\n{fallback_note}"
