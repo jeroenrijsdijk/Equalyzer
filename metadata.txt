@@ -4,14 +4,14 @@ qgisMinimumVersion=3.16
 qgisMaximumVersion=4.99
 description=Split polygons into equal parts, equal areas, or parking bays
 version=2.0.1
-author=Abel Koszeghy
-email=abelke@gmail.com
+author=Jay (original plugin by Abel Koszeghy)
+email=jri@rvmk.nl
 
 about=Splits polygons three ways. Equal parts: draw a direction line and get N parts of exactly equal area, cut parallel to the line. Equal areas: the same with a target area per part. Parking bays: select a strip (or draw a line over it), and it is cut into 2.5 x 5 m bays, the orientation and count inferred from the strip's own size, with every attribute of the strip copied to the bays and the option to replace the strip in its layer. Works in QGIS 3 and QGIS 4, and in geographic as well as projected CRSs.
 
-homepage=https://github.com/danzig666/Equalyzer
-tracker=https://github.com/danzig666/Equalyzer/issues
-repository=https://github.com/danzig666/Equalyzer
+homepage=https://github.com/jeroenrijsdijk/Equalyzer
+tracker=https://github.com/jeroenrijsdijk/Equalyzer/issues
+repository=https://github.com/jeroenrijsdijk/Equalyzer
 
 hasProcessingProvider=no
 tags=vector,polygon,split,divide,equal area,parking

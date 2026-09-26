@@ -165,9 +165,15 @@ Errors always land in that panel with a full traceback.
   south; there the layer's own coordinates are used.
 - The animation at the top shows the original version of the plugin.
 
+## Issues and contact
+
+Report problems at https://github.com/jeroenrijsdijk/Equalyzer/issues, or mail Jay at jri@rvmk.nl.
+When a split goes wrong, the *Equalyzer* tab of the Log Messages panel
+usually says why; please include it.
+
 ## Credits and licence
 
-Originally written by Abel Koszeghy
-(https://github.com/danzig666/Equalyzer). This fork rewrote the splitting
-engine, added parking-bay mode and QGIS 4 support. MIT licence, see
-`LICENSE`.
+This is a fork of Equalyzer by Abel Koszeghy
+(https://github.com/danzig666/Equalyzer), maintained by Jay. The fork
+rewrote the splitting engine and added parking-bay mode and QGIS 4 support.
+MIT licence, see `LICENSE`.
