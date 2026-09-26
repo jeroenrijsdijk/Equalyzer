@@ -7,7 +7,7 @@ Layout of this file
 -------------------
   compatibility layer   QGIS 3 / QGIS 4 differences, all in one place
   helpers               feature picking, metric work frame, output fields
-  map tools             LineDrawTool, PointPickTool
+  map tools             LineDrawTool, PointSelectTool
   SplitPreviewDialog    equal-parts and equal-area modes
   BayPlanDialog         parking-bay mode
   _SplitEngine          the splitting itself
@@ -46,7 +46,7 @@ from qgis.core import (
     QgsTextFormat, QgsRectangle, QgsPointXY, QgsSnappingConfig,
     QgsPoint, QgsTolerance, QgsMapLayer, QgsCoordinateTransform,
     QgsCoordinateReferenceSystem, QgsMessageLog, Qgis,
-    QgsVectorFileWriter, QgsField, QgsFeatureRequest
+    QgsVectorFileWriter, QgsField, QgsFeatureRequest, QgsPointLocator
 )
 from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand, QgsSnapIndicator
 from qgis.utils import iface
@@ -231,6 +231,12 @@ def compat_snapping_enums():
     return mode, vertex, unit
 
 
+def area_label(value, unit, abbreviation):
+    """Area as label text: two decimals for m² and ft², four for larger units."""
+    decimals = 2 if unit in (AREA_SQUARE_METERS, AREA_SQUARE_FEET) else 4
+    return f"{value:.{decimals}f} {abbreviation}"
+
+
 def crs_area_unit_for(layer):
     """Area unit matching the layer's map units, for planar measurements."""
     unit = layer.crs().mapUnits()
@@ -300,20 +306,78 @@ def pick_feature_under_line(layer, points):
 PLUGIN_FIELD_NAMES = ("source_fid", "part_id", "area_val", "area_txt")
 
 
-def make_distance_area(layer):
-    """Area calculator that returns square metres for any layer.
+def _ellipsoidal_distance_area(crs):
+    """QgsDistanceArea that measures on an ellipsoid whenever one can be found.
 
-    The source CRS must be set before the ellipsoid, or the ellipsoidal
-    transform is built against the wrong CRS. For a geographic layer an
-    ellipsoid is forced, otherwise measureArea() would return square degrees.
+    Tries the project's ellipsoid, then the CRS's own, then WGS84.
     """
     da = QgsDistanceArea()
-    context = QgsProject.instance().transformContext()
-    da.setSourceCrs(layer.crs(), context)
+    da.setSourceCrs(crs, QgsProject.instance().transformContext())
+    for name in (QgsProject.instance().ellipsoid(), crs.ellipsoidAcronym(), "WGS84"):
+        if not name or name.upper() == "NONE":
+            continue
+        try:
+            da.setEllipsoid(name)
+        except Exception:
+            continue
+        if da.willUseEllipsoid():
+            break
+    return da
 
+
+def locally_metric(layer, sample_geom=None):
+    """True when the layer's coordinates are ground metres around the data.
+
+    Geographic CRSs are not, nor are CRSs in feet. Web Mercator claims metres
+    but stretches them by 1/cos(latitude), 1.6 times in the Netherlands, so
+    the planar length of a short segment is compared with its length on the
+    ellipsoid. Within half a percent counts as metric: RD New and UTM pass.
+    """
+    crs = layer.crs()
+    if crs.isGeographic() or crs.mapUnits() != DISTANCE_METERS:
+        return False
+    try:
+        rect = sample_geom.boundingBox() if sample_geom is not None else layer.extent()
+        centre = rect.center()
+        step = max(rect.width(), rect.height()) / 10.0 or 10.0
+        a = QgsPointXY(centre.x(), centre.y())
+        b = QgsPointXY(centre.x() + step, centre.y() + step)
+        da = _ellipsoidal_distance_area(crs)
+        if not da.willUseEllipsoid():
+            return True
+        ground = da.measureLine(a, b)
+        if ground <= 0.0:
+            return True
+        return abs(math.hypot(step, step) / ground - 1.0) < 0.005
+    except Exception as e:
+        dbg(f"locally_metric check failed, assuming metric: {e!r}")
+        return True
+
+
+def first_geometry(features):
+    """First non-empty geometry of a feature list, or None."""
+    for feature in features or []:
+        geometry = feature.geometry()
+        if geometry is not None and not geometry.isEmpty():
+            return geometry
+    return None
+
+
+def make_distance_area(layer, sample_geom=None):
+    """Area calculator for a layer, honouring the project's ellipsoid setting.
+
+    When the project measures planar ("None") but the layer's coordinates are
+    not ground metres, an ellipsoid is forced anyway; otherwise areas would
+    come out in square degrees, or inflated 2.6 times for Web Mercator in the
+    Netherlands. The source CRS must be set before the ellipsoid, or the
+    ellipsoidal transform is built against the wrong CRS.
+    """
     ellipsoid = QgsProject.instance().ellipsoid()
-    if layer.crs().isGeographic() and (not ellipsoid or ellipsoid.upper() == "NONE"):
-        ellipsoid = layer.crs().ellipsoidAcronym() or "WGS84"
+    if (not ellipsoid or ellipsoid.upper() == "NONE") and not locally_metric(layer, sample_geom):
+        return _ellipsoidal_distance_area(layer.crs())
+
+    da = QgsDistanceArea()
+    da.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
     if ellipsoid:
         try:
             da.setEllipsoid(ellipsoid)
@@ -337,7 +401,13 @@ def build_output_fields(source_layer):
     ]
     taken = set(PLUGIN_FIELD_NAMES)
     mapping = []
+    try:
+        keys = set(source_layer.primaryKeyAttributes())
+    except Exception:
+        keys = set()
     for index, field in enumerate(source_layer.fields()):
+        if index in keys:
+            continue            # e.g. a GeoPackage fid; source_fid already holds it
         copy = QgsField(field)
         name = field.name()
         if name in taken:
@@ -376,26 +446,34 @@ def find_split_parts_layer(source_layer, field_names):
     return None
 
 
-def metric_work_transforms(layer, sample_point):
+def metric_work_transforms(layer, sample_geom):
     """Transforms to and from a metric frame, or (None, None, None).
 
-    Geometry in a geographic CRS cannot be reasoned about with straight lines:
-    at 52 degrees north a degree of longitude is only 62% of a degree of
-    latitude, so right angles in the coordinates are not right angles on the
-    ground. Everything that involves angles or distances is therefore done in
-    the UTM zone of the data and transformed back afterwards.
+    Angles and distances only mean something in coordinates that are ground
+    metres. In a geographic CRS a degree of longitude is 62% of a degree of
+    latitude at 52 degrees north, so right angles in the coordinates are not
+    right angles on the ground; Web Mercator and CRSs in feet get lengths
+    wrong. For such layers the work is done in the UTM zone of the data and
+    transformed back afterwards. Layers that are already metric (RD New, UTM)
+    are used as they are.
     """
-    crs = layer.crs()
-    if not crs.isGeographic():
+    if sample_geom is None or sample_geom.isEmpty() or locally_metric(layer, sample_geom):
         return None, None, None
+    crs = layer.crs()
     try:
-        lon, lat = sample_point.x(), sample_point.y()
+        context = QgsProject.instance().transformContext()
+        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        centre = sample_geom.centroid().asPoint()
+        if crs != wgs84:
+            centre = QgsCoordinateTransform(crs, wgs84, context).transform(centre)
+        lon, lat = centre.x(), centre.y()
+        if abs(lat) > 84.0:
+            return None, None, None          # outside UTM; keep the layer frame
         zone = max(1, min(60, int((lon + 180.0) / 6.0) + 1))
         epsg = (32600 if lat >= 0 else 32700) + zone
         work = QgsCoordinateReferenceSystem(f"EPSG:{epsg}")
         if not work.isValid():
             return None, None, None
-        context = QgsProject.instance().transformContext()
         return (QgsCoordinateTransform(crs, work, context),
                 QgsCoordinateTransform(work, crs, context),
                 work)
@@ -416,26 +494,11 @@ def to_work_crs(geom, transform):
 
 
 def metric_length_measure(layer):
-    """Callable (a, b) -> length in metres, whatever the layer CRS is.
+    """Callable (a, b) -> length in metres between two points in layer CRS.
 
-    Parking bays are specified in metres, so strip dimensions must be measured
-    in metres even when the layer sits in degrees.
+    Used for strip sizes when no metric work frame could be set up.
     """
-    crs = layer.crs()
-    da = QgsDistanceArea()
-    try:
-        da.setSourceCrs(crs, QgsProject.instance().transformContext())
-    except Exception:
-        pass
-
-    ellipsoid = QgsProject.instance().ellipsoid()
-    if crs.isGeographic() and (not ellipsoid or ellipsoid.upper() == "NONE"):
-        ellipsoid = crs.ellipsoidAcronym() or "WGS84"
-    if ellipsoid and ellipsoid.upper() != "NONE":
-        try:
-            da.setEllipsoid(ellipsoid)
-        except Exception:
-            pass
+    da = _ellipsoidal_distance_area(layer.crs())
 
     def measure(point_a, point_b):
         value = da.measureLine(point_a, point_b)
@@ -477,47 +540,97 @@ def compat_write_vector(layer, path, driver="GeoJSON", encoding="UTF-8"):
 # Map Tools
 # ---------------------------------------------------------------------------
 
-class LineDrawTool(QgsMapToolEmitPoint):
-    """Interactive tool: user clicks two points to define a direction line."""
+class _OneShotTool(QgsMapToolEmitPoint):
+    """Map tool that captures something once and then gets out of the way.
+
+    It hands the canvas back to the tool that was active before, so that after
+    drawing a direction line the user is straight back in, say, the Add
+    Polygon Feature tool they were digitising with.
+    """
 
     def __init__(self, canvas, callback):
         super().__init__(canvas)
         self.canvas = canvas
         self.callback = callback
+        previous = canvas.mapTool()
+        self.previous_tool = None if previous is None or previous == self else previous
+
+    def _release(self):
+        """Give the canvas back to the previous tool, or to none."""
+        try:
+            if self.canvas.mapTool() != self:
+                return
+            if self.previous_tool is not None:
+                self.canvas.setMapTool(self.previous_tool)
+            else:
+                self.canvas.unsetMapTool(self)
+        except Exception:                      # previous tool already deleted
+            try:
+                self.canvas.unsetMapTool(self)
+            except Exception:
+                pass
+
+    def _finish(self, value):
+        self._release()
+        self.callback(value)
+
+
+class LineDrawTool(_OneShotTool):
+    """Click two points to define a direction line (snaps to vertices).
+
+    Snapping is switched on for this tool only: the canvas snapping settings
+    are put back when the tool is deactivated, so the user's own digitising
+    snapping is left as it was.
+    """
+
+    def __init__(self, canvas, callback):
+        super().__init__(canvas, callback)
         self.points = []
         self.rubber_band = QgsRubberBand(canvas, GEOM_LINE)
         self.rubber_band.setColor(QColor(Qt.GlobalColor.red))
         self.rubber_band.setWidth(2)
 
         self.snapping_utils = canvas.snappingUtils()
-        self.snapping_config = QgsSnappingConfig()
-        try:
-            snap_mode, snap_vertex, snap_unit = compat_snapping_enums()
-            self.snapping_config.setMode(snap_mode)
-            self.snapping_config.setEnabled(True)
-
-            root = QgsProject.instance().layerTreeRoot()
-            for tree_layer in root.findLayers():
-                if tree_layer.isVisible():
-                    layer = tree_layer.layer()
-                    if layer is not None and layer.type() == LAYER_VECTOR:
-                        settings = QgsSnappingConfig.IndividualLayerSettings(
-                            True, snap_vertex, 10, snap_unit
-                        )
-                        self.snapping_config.setIndividualLayerSettings(layer, settings)
-
-            self.snapping_utils.setConfig(self.snapping_config)
-        except Exception as e:
-            # Snapping is a convenience, not a requirement: never block the tool.
-            QgsMessageLog.logMessage(
-                f"Snapping setup skipped: {e}", "Equalyzer", Qgis.MessageLevel.Warning
-            )
+        self._previous_snapping = QgsSnappingConfig(self.snapping_utils.config())
         self.snap_indicator = QgsSnapIndicator(canvas)
         iface.messageBar().pushInfo(
             "Equalyzer",
             "Click two points to define the cut direction (snaps to vertices). "
             "Right-click or Escape to abort."
         )
+
+    def activate(self):
+        super().activate()
+        config = QgsSnappingConfig()
+        try:
+            snap_mode, snap_vertex, snap_unit = compat_snapping_enums()
+            config.setMode(snap_mode)
+            config.setEnabled(True)
+            for tree_layer in QgsProject.instance().layerTreeRoot().findLayers():
+                layer = tree_layer.layer()
+                if tree_layer.isVisible() and layer is not None and layer.type() == LAYER_VECTOR:
+                    config.setIndividualLayerSettings(
+                        layer,
+                        QgsSnappingConfig.IndividualLayerSettings(True, snap_vertex, 10, snap_unit)
+                    )
+            self.snapping_utils.setConfig(config)
+        except Exception as e:
+            # Snapping is a convenience, not a requirement: never block the tool.
+            QgsMessageLog.logMessage(
+                f"Snapping setup skipped: {e}", "Equalyzer", Qgis.MessageLevel.Warning
+            )
+
+    def deactivate(self):
+        try:
+            self.snapping_utils.setConfig(self._previous_snapping)
+        except Exception:
+            pass
+        try:
+            self.snap_indicator.setMatch(QgsPointLocator.Match())
+        except Exception:
+            pass
+        self.rubber_band.reset(GEOM_LINE)
+        super().deactivate()
 
     def canvasMoveEvent(self, event):
         map_pos = self.toMapCoordinates(event.pos())
@@ -540,9 +653,7 @@ class LineDrawTool(QgsMapToolEmitPoint):
             if len(self.points) == 1:
                 iface.messageBar().pushInfo("Equalyzer", "Click second point for direction line.")
             elif len(self.points) == 2:
-                self.rubber_band.reset(GEOM_LINE)
-                self.canvas.unsetMapTool(self)
-                self.callback(self.points)
+                self._finish(list(self.points))
         except Exception as e:
             iface.messageBar().pushCritical(
                 "Equalyzer",
@@ -555,19 +666,15 @@ class LineDrawTool(QgsMapToolEmitPoint):
             self._abort()
 
     def _abort(self):
-        self.rubber_band.reset(GEOM_LINE)
         self.points = []
-        self.canvas.unsetMapTool(self)
-        self.callback(None)
+        self._finish(None)
 
 
-class PointSelectTool(QgsMapToolEmitPoint):
-    """Interactive tool: user clicks a point to choose the starting side."""
+class PointSelectTool(_OneShotTool):
+    """Click a point to choose the side the numbering starts from."""
 
     def __init__(self, canvas, callback):
-        super().__init__(canvas)
-        self.canvas = canvas
-        self.callback = callback
+        super().__init__(canvas, callback)
         iface.messageBar().pushInfo(
             "Equalyzer",
             "Click inside a polygon to choose the starting side. "
@@ -576,17 +683,13 @@ class PointSelectTool(QgsMapToolEmitPoint):
 
     def canvasReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
-            self.canvas.unsetMapTool(self)
-            self.callback(None)
+            self._finish(None)
             return
-        point = self.toMapCoordinates(event.pos())
-        self.canvas.unsetMapTool(self)
-        self.callback(point)
+        self._finish(self.toMapCoordinates(event.pos()))
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            self.canvas.unsetMapTool(self)
-            self.callback(None)
+            self._finish(None)
 
 
 # ---------------------------------------------------------------------------
@@ -859,6 +962,8 @@ class SplitPreviewDialog(QDialog):
             dbg(f"auto-pick failed: {e!r}")
 
         if feature is None:
+            if self.polygon_features:
+                return          # redrawn beside the polygon: keep the earlier pick
             QMessageBox.warning(
                 self, "No polygon found",
                 "The direction line does not cross a polygon in the active layer.\n\n"
@@ -867,6 +972,11 @@ class SplitPreviewDialog(QDialog):
             )
             return
 
+        if self.polygon_features and self.polygon_features[0].id() == feature.id():
+            return
+        if self.polygon_features:
+            self.start_point = None     # it belonged to the previous polygon
+            self._clear_preview()
         self.polygon_features = [feature]
         self.auto_picked = True
         try:
@@ -963,7 +1073,9 @@ class SplitPreviewDialog(QDialog):
                 f"Failed to capture direction line: {e}"
             )
         finally:
-            if self.direction_points and not self.polygon_features:
+            # Pick from the line when nothing was selected, and pick again when
+            # the line is redrawn over another polygon.
+            if self.direction_points and (not self.polygon_features or self.auto_picked):
                 self._auto_select_from_direction()
             self.active_tool = None
             self._restore_dialog_focus()
@@ -1186,18 +1298,14 @@ class SplitPreviewDialog(QDialog):
 
     def accept(self):
         # Keep accept path minimal to avoid modal-close deadlocks on some setups.
-        try:
-            iface.messageBar().pushInfo("Equalyzer", "Apply clicked — starting split.")
-        except Exception:
-            pass
         self._save_precision_setting()
         self._save_dialog_geometry()
         self._defer_close_cleanup = True
         super().accept()
 
     def closeEvent(self, event):
-        if self.active_tool and iface.mapCanvas().mapTool() == self.active_tool:
-            iface.mapCanvas().unsetMapTool(self.active_tool)
+        if self.active_tool is not None:
+            self.active_tool._release()
         self.active_tool = None
         self._save_precision_setting()
         self._save_dialog_geometry()
@@ -1224,15 +1332,8 @@ class BayPlanDialog(QDialog):
         self.measure = measure
         self.settings = QSettings()
 
-        sample = None
-        for feature in polygon_features:
-            geometry = feature.geometry()
-            if geometry is not None and not geometry.isEmpty():
-                sample = geometry.centroid().asPoint()
-                break
-        self.to_work, self.from_work = (None, None)
-        if sample is not None:
-            self.to_work, self.from_work, _work = metric_work_transforms(layer, sample)
+        self.to_work, self.from_work, _work = metric_work_transforms(
+            layer, first_geometry(polygon_features))
         self.plans = []
         self.fallback_direction = None
 
@@ -1284,8 +1385,6 @@ class BayPlanDialog(QDialog):
         output_form = QFormLayout(output_group)
         self.output_combo = QComboBox()
         self.output_combo.addItem("Collect the bays in the Split Parts layer", "collect")
-        self.output_combo.addItem(
-            "Collect them there and delete the original polygon", "collect_delete")
         self.output_combo.addItem(
             "Replace the original in this layer with the bays", "replace")
         stored = self.settings.value("Equalyzer/bayOutput", "collect")
@@ -1401,7 +1500,6 @@ class BayPlanDialog(QDialog):
             "target_value": 0,
             "precision": 3,
             "replace_in_source": choice == "replace",
-            "delete_source": choice in ("replace", "collect_delete"),
             "bay_settings": {
                 "bay_length": self.length_spin.value(),
                 "bay_width": self.width_spin.value(),
@@ -1451,23 +1549,6 @@ class _SplitEngine:
         )
         self.bay_plans = {}          # fid -> BayPlan, for reporting
 
-        # Work frame: angles and distances are meaningless in degrees.
-        sample = None
-        for feature in polygon_features:
-            geometry = feature.geometry()
-            if geometry is not None and not geometry.isEmpty():
-                sample = geometry.centroid().asPoint()
-                break
-        self.to_work, self.from_work, work_crs = (None, None, None)
-        if sample is not None:
-            self.to_work, self.from_work, work_crs = metric_work_transforms(layer, sample)
-        self.work_da = None
-        if work_crs is not None:
-            self.work_da = QgsDistanceArea()
-            self.work_da.setSourceCrs(work_crs, QgsProject.instance().transformContext())
-            dbg(f"working in {work_crs.authid()} because {layer.crs().authid()} "
-                "is a geographic CRS")
-
         # Derived: angles from the user-drawn direction line in layer CRS
         pt_a, pt_b = direction_points
         dx = pt_b.x() - pt_a.x()
@@ -1478,6 +1559,28 @@ class _SplitEngine:
         # User-drawn line is the cut direction reference; cuts are parallel to it.
         self.direction_line_angle_deg = math.degrees(math.atan2(dy, dx))
         self.cut_line_angle_deg = self.direction_line_angle_deg
+
+        # Work frame for layers whose coordinates are not ground metres. The
+        # cut direction has to be expressed in that frame too: an angle
+        # measured in degrees is not the same angle in metres.
+        self.to_work, self.from_work, work_crs = metric_work_transforms(
+            layer, first_geometry(polygon_features))
+        self.work_da = None
+        self.work_cut_angle_deg = None
+        if work_crs is not None:
+            self.work_da = QgsDistanceArea()
+            self.work_da.setSourceCrs(work_crs, QgsProject.instance().transformContext())
+            try:
+                a = self.to_work.transform(QgsPointXY(pt_a.x(), pt_a.y()))
+                b = self.to_work.transform(QgsPointXY(pt_b.x(), pt_b.y()))
+                self.work_cut_angle_deg = math.degrees(math.atan2(b.y() - a.y(), b.x() - a.x()))
+                dbg(f"working in {work_crs.authid()} because {layer.crs().authid()} "
+                    "coordinates are not ground metres")
+            except Exception as e:
+                # Without the direction in the work frame the cuts would come
+                # out skewed there; stay in the layer frame instead.
+                dbg(f"could not express the direction in the work frame: {e!r}")
+                self.to_work = self.from_work = self.work_da = None
 
     # ------------------------------------------------------------------
     # Public
@@ -1573,15 +1676,20 @@ class _SplitEngine:
 
         return parts_by_feature
 
-    def _set_direction_from_points(self, points):
-        """Point the cut lines along the given pair of points."""
-        pt_a, pt_b = points
+    def _use_strip_direction(self, cut_points):
+        """Cut this strip along `cut_points`, which are in the frame the strip
+        was measured in: the work frame when there is one, else the layer."""
+        pt_a, pt_b = cut_points
         dx = pt_b.x() - pt_a.x()
         dy = pt_b.y() - pt_a.y()
-        if math.hypot(dx, dy) < 1e-9:
+        if math.hypot(dx, dy) < 1e-12:
             return False
-        self.direction_line_angle_deg = math.degrees(math.atan2(dy, dx))
-        self.cut_line_angle_deg = self.direction_line_angle_deg
+        angle = math.degrees(math.atan2(dy, dx))
+        if self.to_work is not None:
+            self.work_cut_angle_deg = angle
+        else:
+            self.direction_line_angle_deg = angle
+            self.cut_line_angle_deg = angle
         return True
 
     def _measure_strip(self, feature, geom):
@@ -1605,7 +1713,7 @@ class _SplitEngine:
         dbg(f"  fid={fid}: strip {length:.2f} x {depth:.2f} m, "
             f"fit={fit if fit is None else round(fit, 3)}, "
             f"cut direction {axis_angle_degrees(cut_points):.2f}deg")
-        if self.auto_direction and not self._set_direction_from_points(cut_points):
+        if self.auto_direction and not self._use_strip_direction(cut_points):
             self._record_fallback(
                 f"Feature {fid}: strip is too small to take a direction from."
             )
@@ -1649,14 +1757,16 @@ class _SplitEngine:
             return self._split_equal_parts(geom, num_parts, sweep_from_low)
 
         work_geom = to_work_crs(geom, self.to_work)
-        saved_da, saved_total = self.da, self._current_total_area
+        saved = (self.da, self._current_total_area, self.cut_line_angle_deg)
         if self.work_da is not None:
             self.da = self.work_da
+        if self.work_cut_angle_deg is not None:
+            self.cut_line_angle_deg = self.work_cut_angle_deg
         self._current_total_area = work_geom.area()
         try:
             parts = self._split_equal_parts(work_geom, num_parts, sweep_from_low)
         finally:
-            self.da, self._current_total_area = saved_da, saved_total
+            self.da, self._current_total_area, self.cut_line_angle_deg = saved
 
         return [to_work_crs(part, self.from_work) for part in parts]
 
@@ -3324,12 +3434,14 @@ class PolygonSplitter:
         self.canvas = iface.mapCanvas()
         self.actions = []
         self.menu = "&Equalyzer"
-        self.toolbar = self.iface.addToolBar("Equalyzer")
+        self.toolbar = None              # created in initGui, removed in unload
         self._preview_global_bands = set()
         self._signals_connected = False
         self._active_split_dialogs = set()
 
     def initGui(self):
+        self.toolbar = self.iface.addToolBar("Equalyzer")
+        self.toolbar.setObjectName("EqualyzerToolbar")
         icon_path = os.path.join(os.path.dirname(__file__), 'icon_area.png')
         self.equal_area_action = QAction(
             QIcon(icon_path),
@@ -3352,7 +3464,7 @@ class PolygonSplitter:
         self.toolbar.addAction(self.equal_parts_action)
         self.actions.append(self.equal_parts_action)
 
-        icon_path = os.path.join(os.path.dirname(__file__), 'icon_count.png')
+        icon_path = os.path.join(os.path.dirname(__file__), 'icon_bays.png')
         self.bays_action = QAction(
             QIcon(icon_path),
             "Split into Parking Bays",
@@ -3406,10 +3518,27 @@ class PolygonSplitter:
                 pass
             self._signals_connected = False
 
+        for dialog in list(self._active_split_dialogs):
+            try:
+                dialog.reject()
+            except Exception:
+                pass
+        self._active_split_dialogs.clear()
+
+        tool = getattr(self, "_bay_pick_tool", None)
+        if tool is not None:
+            tool._release()
+            self._bay_pick_tool = None
+
         for action in self.actions:
             self.iface.removePluginMenu(self.menu, action)
-            self.iface.removeToolBarIcon(action)
-        del self.toolbar
+        self.actions = []
+        # Removing the toolbar widget itself; deleting the Python name alone
+        # left an empty toolbar behind on every plugin reload.
+        if self.toolbar is not None:
+            self.iface.mainWindow().removeToolBar(self.toolbar)
+            self.toolbar.deleteLater()
+            self.toolbar = None
 
     def _register_preview_band(self, band):
         if band is not None:
@@ -3560,44 +3689,35 @@ class PolygonSplitter:
             dbg(f"restoring the active layer failed: {e!r}")
 
     def _edit_source_layer(self, layer, work, description):
-        """Run `work(layer)` inside one undoable edit command.
+        """Run `work(layer)` as one named edit command and leave it unsaved.
 
-        If the layer is already in edit mode the change joins that session and
-        the user commits it themselves, so it stays undoable. Otherwise a
-        session is opened and committed here.
+        The change lands in the layer's edit buffer as a single undo step; the
+        user reviews it and saves the layer when satisfied. Edit mode is
+        switched on if needed. A failed edit is taken back completely.
+
+        Returns (True, switched_on) or (False, message).
         """
-        started = False
+        switched_on = False
         if not layer.isEditable():
             if not layer.startEditing():
-                return False, "The source layer could not be opened for editing."
-            started = True
+                return False, f"'{layer.name()}' could not be switched to edit mode."
+            switched_on = True
 
-        ok = False
+        layer.beginEditCommand(description)
         try:
-            layer.beginEditCommand(description)
             ok = bool(work(layer))
-            layer.endEditCommand()
+            reason = "the layer did not accept the change"
         except Exception as e:
-            try:
-                layer.destroyEditCommand()
-            except Exception:
-                pass
-            if started:
-                layer.rollBack()
-            return False, f"Editing the source layer failed: {e}"
+            ok, reason = False, str(e)
 
-        if not ok:
-            if started:
-                layer.rollBack()
-            return False, f"Editing the source layer failed: {layer.commitErrors()}"
+        if ok:
+            layer.endEditCommand()
+            return True, switched_on
 
-        if started:
-            if not layer.commitChanges():
-                errors = "; ".join(layer.commitErrors())
-                layer.rollBack()
-                return False, f"Changes could not be saved: {errors}"
-            return True, "saved"
-        return True, "pending"
+        layer.destroyEditCommand()          # undoes whatever part did happen
+        if switched_on:
+            layer.rollBack()
+        return False, f"Editing '{layer.name()}' failed: {reason}"
 
     def _copyable_attributes(self, layer):
         """Field indexes worth copying: everything except the primary key.
@@ -3611,21 +3731,42 @@ class PolygonSplitter:
             keys = set()
         return [i for i in range(len(layer.fields())) if i not in keys]
 
+    def _fit_to_layer(self, geom, wkb_type):
+        """The geometry in the layer's own type: single or multi, with Z or M.
+
+        A Polygon layer rejects MultiPolygon geometries on save, and a PolygonZ
+        layer rejects 2D ones.
+        """
+        try:
+            fitted = [g for g in geom.coerceToType(wkb_type) if not g.isEmpty()]
+            if fitted:
+                return fitted
+        except Exception as e:
+            dbg(f"coerceToType failed: {e!r}")
+        return [geom]
+
     def _replace_in_source_layer(self, layer, parts_by_feature):
-        """Put the parts into the source layer and remove the originals."""
+        """Put the parts into the source layer and remove the originals.
+
+        Returns (ok, message_or_switched_on, strips_replaced, parts_written).
+        """
         indexes = self._copyable_attributes(layer)
         fields = layer.fields()
+        wkb_type = layer.wkbType()
 
         new_features = []
         source_ids = []
         for feature, parts in parts_by_feature:
-            source_ids.append(feature.id())
+            pieces = []
             for part in parts:
                 if part is None or part.isEmpty():
                     continue
-                for geom in self._extract_multipolygon_parts(part):
-                    if geom.isEmpty():
-                        continue
+                pieces.extend(g for g in self._extract_multipolygon_parts(part) if not g.isEmpty())
+            if len(pieces) < 2:
+                continue            # a strip that holds one bay stays as it is
+            source_ids.append(feature.id())
+            for piece in pieces:
+                for geom in self._fit_to_layer(piece, wkb_type):
                     new_feature = QgsFeature(fields)
                     new_feature.setGeometry(geom)
                     for index in indexes:
@@ -3636,25 +3777,16 @@ class PolygonSplitter:
                     new_features.append(new_feature)
 
         if not new_features:
-            return False, "No parts to write back.", 0
+            return False, "None of the strips was divided, so nothing was replaced.", 0, 0
 
         def work(target):
             return target.addFeatures(new_features) and target.deleteFeatures(source_ids)
 
-        ok, state = self._edit_source_layer(
+        ok, info = self._edit_source_layer(
             layer, work, f"Equalyzer: replace {len(source_ids)} polygon(s) by "
                          f"{len(new_features)} part(s)"
         )
-        return ok, state, len(new_features)
-
-    def _delete_source_features(self, layer, polygon_features):
-        ids = [f.id() for f in polygon_features]
-        if not ids:
-            return True, "saved"
-        return self._edit_source_layer(
-            layer, lambda target: target.deleteFeatures(ids),
-            f"Equalyzer: remove {len(ids)} split polygon(s)"
-        )
+        return ok, info, len(source_ids), len(new_features)
 
     def _create_temporary_output_layer(self, source_layer, parts_by_feature,
                                        da, project_unit, unit_abbrev,
@@ -3662,6 +3794,7 @@ class PolygonSplitter:
         """Last-resort output path: build and add a fresh temporary memory layer."""
         crs_authid = source_layer.crs().authid()
         temp_layer = QgsVectorLayer(f"MultiPolygon?crs={crs_authid}", "Split Parts (temp)", "memory")
+        temp_layer.setCrs(source_layer.crs())
         if not temp_layer.isValid():
             return None, "Fallback layer could not be created"
 
@@ -3698,7 +3831,7 @@ class PolygonSplitter:
                     f.setAttribute("source_fid", int(source_fid) if source_fid is not None else -1)
                     f.setAttribute("part_id", part_counter)
                     f.setAttribute("area_val", float(area_display))
-                    f.setAttribute("area_txt", f"{area_display:.4f} {unit_abbrev}")
+                    f.setAttribute("area_txt", area_label(area_display, project_unit, unit_abbrev))
                     for source_index, output_name in temp_attribute_map:
                         try:
                             f.setAttribute(output_name, feature.attribute(source_index))
@@ -3784,18 +3917,21 @@ class PolygonSplitter:
             pass
 
     def _on_bay_line_captured(self, points):
-        tool = getattr(self, "_bay_pick_tool", None)
         layer = getattr(self, "_bay_pick_layer", None)
         self._bay_pick_tool = None
         self._bay_pick_layer = None
-        try:
-            if tool is not None:
-                iface.mapCanvas().unsetMapTool(tool)
-        except Exception:
-            pass
 
         if not points or layer is None:
             return
+
+        # The tool returns canvas coordinates; the layer may use another CRS.
+        try:
+            canvas_crs = iface.mapCanvas().mapSettings().destinationCrs()
+            if canvas_crs != layer.crs():
+                transform = QgsCoordinateTransform(canvas_crs, layer.crs(), QgsProject.instance())
+                points = [transform.transform(QgsPointXY(p)) for p in points]
+        except Exception as e:
+            dbg(f"could not transform the picking line to the layer CRS: {e!r}")
 
         feature = None
         try:
@@ -3820,17 +3956,12 @@ class PolygonSplitter:
 
     def _open_bay_dialog(self, layer, polygon_features):
         measure = metric_length_measure(layer)
-        if layer.crs().mapUnits() != DISTANCE_METERS:
-            try:
-                iface.messageBar().pushInfo(
-                    "Equalyzer",
-                    "This layer is not in a metric CRS, so strips are measured "
-                    "and cut in the matching UTM zone and transformed back."
-                )
-            except Exception:
-                pass
+        sample = first_geometry(polygon_features)
+        if not locally_metric(layer, sample):
+            dbg("layer coordinates are not ground metres; strips are measured "
+                "and cut in the matching UTM zone")
 
-        da = make_distance_area(layer)
+        da = make_distance_area(layer, sample)
 
         project_unit = QgsProject.instance().areaUnits()
         unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)
@@ -3878,7 +4009,7 @@ class PolygonSplitter:
                 raise Exception("No polygon features found in the selection.")
 
         # Set up distance/area measurement
-        da = make_distance_area(layer)
+        da = make_distance_area(layer, first_geometry(polygon_features))
 
         project_unit = QgsProject.instance().areaUnits()
         unit_abbrev = QgsUnitTypes.toAbbreviatedString(project_unit)
@@ -4012,26 +4143,28 @@ class PolygonSplitter:
             self._log(note, Qgis.MessageLevel.Info)
 
         if params.get("replace_in_source"):
-            ok, state, written = self._replace_in_source_layer(layer, parts_by_feature)
+            ok, info, replaced, written = self._replace_in_source_layer(layer, parts_by_feature)
             if not ok:
-                QMessageBox.critical(None, "Equalyzer Error", state)
+                QMessageBox.critical(None, "Equalyzer Error", info)
                 return
             try:
                 layer.removeSelection()
                 layer.triggerRepaint()
             except Exception:
                 pass
-            tail = ("" if state != "pending" else
-                    "\n\nThe layer was already in edit mode, so the change is in its "
-                    "edit buffer: undo with Ctrl+Z or save it yourself.")
-            QMessageBox.information(
-                None, "Equalyzer",
-                f"Replaced {len(polygon_features)} polygon(s) in '{layer.name()}' "
-                f"by {written} part(s)." + tail
+            message = (
+                f"Replaced {replaced} polygon(s) in '{layer.name()}' by {written} part(s).\n\n"
+                "The change is in the layer's edit buffer: Ctrl+Z takes it back, "
+                "Save Layer Edits keeps it."
             )
+            if info:
+                message += " Edit mode was switched on for this."
+            if method_fallback_messages:
+                message += "\n\nNotes:\n" + "\n".join(method_fallback_messages)
             self._log(f"Replaced in source layer: {written} part(s).",
                       Qgis.MessageLevel.Info, to_bar=True)
             self._restore_active_layer(layer)
+            QMessageBox.information(None, "Equalyzer", message)
             return
 
         # Output layer: reuse the Split Parts layer of this source layer when
@@ -4050,6 +4183,7 @@ class PolygonSplitter:
                 f"Split Parts – {layer.name()}",
                 "memory"
             )
+            output_layer.setCrs(layer.crs())
             if not output_layer.isValid():
                 QMessageBox.critical(None, "Equalyzer Error", "Failed to create output memory layer.")
                 return
@@ -4115,7 +4249,7 @@ class PolygonSplitter:
                     feat.setAttribute("source_fid", int(source_fid) if source_fid is not None else -1)
                     feat.setAttribute("part_id", part_id)
                     feat.setAttribute("area_val", float(area_display))
-                    feat.setAttribute("area_txt", f"{area_display:.4f} {unit_abbrev}")
+                    feat.setAttribute("area_txt", area_label(area_display, project_unit, unit_abbrev))
                     for source_index, output_name in attribute_map:
                         try:
                             feat.setAttribute(output_name, feature.attribute(source_index))
@@ -4230,7 +4364,7 @@ class PolygonSplitter:
         # Count total parts
         total_parts = added_count
         result_msg = (
-            f"Split {len(polygon_features)} polygon(s) into {total_parts} part(s).\n"
+            f"Split {len(parts_by_feature)} polygon(s) into {total_parts} part(s).\n"
         )
         if reused:
             result_msg += (
@@ -4238,24 +4372,6 @@ class PolygonSplitter:
                 f"{output_layer.featureCount()} part(s).\n"
             )
 
-        if params.get("delete_source") and added_count > 0:
-            ok, state = self._delete_source_features(layer, polygon_features)
-            if ok:
-                try:
-                    layer.removeSelection()
-                    layer.triggerRepaint()
-                except Exception:
-                    pass
-                result_msg += (
-                    f"Removed {len(polygon_features)} original polygon(s) from "
-                    f"'{layer.name()}'."
-                    + ("" if state != "pending" else
-                       " That layer was already in edit mode, so the removal sits in "
-                       "its edit buffer.")
-                    + "\n"
-                )
-            else:
-                result_msg += f"The originals were kept: {state}\n"
         if mode == "area":
             result_msg += f"Target area per part: {params['target_value']:.4f} {unit_abbrev}"
         elif mode == "bays":

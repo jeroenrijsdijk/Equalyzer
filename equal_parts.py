@@ -53,10 +53,11 @@ class Profile:
     cum[i]   = area below bands[i][0]; cum[-1] == total area
     """
 
-    __slots__ = ("bands", "cum", "y_min", "y_max", "total")
+    __slots__ = ("bands", "starts", "cum", "y_min", "y_max", "total")
 
     def __init__(self, bands):
         self.bands = bands
+        self.starts = [band[0] for band in bands]      # for bisect lookups
         self.cum = [0.0]
         running = 0.0
         for band in bands:
@@ -147,7 +148,7 @@ def width_at(profile, y):
     """Cross-section width at height y (linear inside a band, 0 outside)."""
     if y <= profile.y_min or y >= profile.y_max:
         return 0.0
-    index = bisect.bisect_right([b[0] for b in profile.bands], y) - 1
+    index = bisect.bisect_right(profile.starts, y) - 1
     index = max(0, min(index, len(profile.bands) - 1))
     y_lo, y_hi, w_lo, w_hi, _ = profile.bands[index]
     if y_hi <= y_lo:
@@ -162,7 +163,7 @@ def area_below(profile, y):
         return 0.0
     if y >= profile.y_max:
         return profile.total
-    index = bisect.bisect_right([b[0] for b in profile.bands], y) - 1
+    index = bisect.bisect_right(profile.starts, y) - 1
     index = max(0, min(index, len(profile.bands) - 1))
     y_lo, y_hi, w_lo, w_hi, _ = profile.bands[index]
     h = y_hi - y_lo
@@ -410,15 +411,14 @@ def split_into_equal_parts(geom, num_parts, rot_angle, measure_area,
             shift = (target * (i + 1) - running) * scale / width
             moved.append(y + shift)
         # keep cuts ordered and inside the polygon
-        cuts = _monotonic(moved, profile.y_min, profile.y_max)
-        parts = _slice(geom, cuts, bbox, center, rot_angle)
-        areas = [measure_area(p) for p in parts]
-        new_deviation = _worst_deviation(areas)
+        new_cuts = _monotonic(moved, profile.y_min, profile.y_max)
+        new_parts = _slice(geom, new_cuts, bbox, center, rot_angle)
+        new_areas = [measure_area(p) for p in new_parts]
+        new_deviation = _worst_deviation(new_areas)
         passes += 1
-        if new_deviation >= deviation:          # not converging, keep best effort
-            deviation = new_deviation
-            break
-        deviation = new_deviation
+        if new_deviation >= deviation:
+            break                               # not improving: keep the previous, better cut
+        cuts, parts, areas, deviation = new_cuts, new_parts, new_areas, new_deviation
 
     if not sweep_from_low:
         parts = list(reversed(parts))
