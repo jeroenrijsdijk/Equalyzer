@@ -158,8 +158,9 @@ def plan_bays(length, depth, bay_length=DEFAULT_BAY_LENGTH,
         warnings.append(f"Strip holds only one bay of {actual:.2f} m.")
     if fit is not None and fit < _FIT_WARNING:
         warnings.append(
-            f"Strip fills only {fit * 100.0:.0f}% of its bounding rectangle, so it "
-            f"is probably curved or irregular; draw the direction line by hand."
+            f"Strip fills only {fit * 100.0:.0f}% of its bounding rectangle: slanted "
+            f"ends, a curve or a ragged outline. Check the bays at the ends; a "
+            f"curved strip is best split into straight pieces first."
         )
 
     return BayPlan(chosen, spacing, count, actual, length, depth, fit, warnings)
@@ -255,11 +256,13 @@ def strip_axis(geom, measure=None):
 
       cut_points  a pair of QgsPointXY along the direction of the cuts, which
                   is across the strip
-      length      size along the strip, in metres
+      length      usable length along the strip, in metres: its area divided
+                  by its depth, so the length along the middle of the strip.
+                  Slanted ends do not add bays this way; the full extent would
+                  count the overhang and squeeze the bays in between.
       depth       size across the strip, in metres
       fit         polygon area over bounding rectangle area; well below 1 means
-                  the strip is curved or ragged and a straight axis is a poor
-                  description of it
+                  slanted ends, a curve or a ragged outline
 
     The axis comes from the polygon's own convex hull rather than from
     QgsGeometry.orientedMinimumBoundingBox(), so the behaviour is the same
@@ -288,25 +291,26 @@ def strip_axis(geom, measure=None):
         QgsPointXY(bx + across[0] * depth_units, by + across[1] * depth_units),
     ]
 
+    try:
+        area_units = geom.area()
+    except Exception:
+        area_units = 0.0
+    usable_units = area_units / depth_units if area_units > 0.0 else length_units
+    fit = area_units / (length_units * depth_units) if area_units > 0.0 else None
+
     if measure is None:
-        length, depth = length_units, depth_units
+        length, depth = usable_units, depth_units
     else:
         try:
-            length = measure(
+            # metres per coordinate unit, along and across the strip
+            full = measure(
                 QgsPointXY(bx, by),
                 QgsPointXY(bx + along[0] * length_units, by + along[1] * length_units),
             )
+            length = usable_units * full / length_units
             depth = measure(cut_points[0], cut_points[1])
         except Exception:
-            length, depth = length_units, depth_units
-
-    fit = None
-    try:
-        rectangle = length_units * depth_units
-        if rectangle > 0.0:
-            fit = geom.area() / rectangle
-    except Exception:
-        pass
+            length, depth = usable_units, depth_units
 
     return cut_points, length, depth, fit
 

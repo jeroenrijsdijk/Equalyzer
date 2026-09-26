@@ -22,16 +22,17 @@ category=Vector
 server=False
 
 changelog=2.0.1
-  Review fixes before publication.
+  Review fixes before publication. README completed for GitHub.
   - Equal parts on a layer in degrees: the drawn direction was applied in the metric work frame without converting it, so cuts came out several degrees off the line.
   - Web Mercator and CRSs in feet are now recognised as not being ground metres (a length check against the ellipsoid) and handled like degrees; before, a 5 m deep strip in EPSG:3857 measured 8.1 m and was not divided, and areas were 2.6 times too large.
   - Drawing a line over a strip in parking-bay mode now also finds it when the project CRS differs from the layer CRS.
   - The direction-line tool no longer leaves its snapping settings behind: your own snapping is restored, and so is the map tool you were using.
   - Replacing a strip in its layer is never saved behind your back any more; it stays in the edit buffer as one undoable step. A refused edit is taken back completely, geometries are converted to the layer's type, and one-bay strips are left alone. The "collect and delete original" choice is gone: it deleted from the real layer while the bays only existed in a temporary one.
+  - Strips with slanted ends: the bay count used the full extent including the slant, which squeezed the bays in between (2.14 m wide in a 15 m strip with 25 degree ends). The length is now measured along the middle of the strip (area / depth).
   - The toolbar is removed on unload instead of piling up on every reload.
   - The ellipsoid correction keeps the better cut when a step does not improve it.
   - Own icon for parking-bay mode; area labels with two decimals for square metres; the source layer's primary key is no longer copied into Split Parts; the result counts only polygons that were actually split.
-  - Tests: 48, now including the plugin's own engine, editing, map tools and non-metric CRSs against a stubbed QGIS.
+  - Tests: 49, now including the plugin's own engine, editing, map tools and non-metric CRSs against a stubbed QGIS.
   2.0.0
   Release of the fork. Since the original 1.4.5:
   - Runs on QGIS 4 (Qt6) as well as QGIS 3.16+ (Qt5); all version-dependent details sit in one compatibility block.
