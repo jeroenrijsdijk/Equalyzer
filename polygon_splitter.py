@@ -53,7 +53,7 @@ from qgis.utils import iface
 
 from .equal_parts import split_into_equal_parts
 from .parking import (
-    plan_bays, strip_axis, axis_angle_degrees,
+    plan_strip, axis_angle_degrees,
     DEFAULT_BAY_LENGTH, DEFAULT_BAY_WIDTH,
     DEFAULT_MIN_BAY_LENGTH, DEFAULT_MIN_BAY_WIDTH,
     PARALLEL, PERPENDICULAR,
@@ -1421,31 +1421,28 @@ class BayPlanDialog(QDialog):
             if geom is None or geom.isEmpty():
                 self.plans.append((feature, None))
                 continue
-            axis = None
+            strip = None
             try:
-                measured_geom = to_work_crs(geom, self.to_work)
-                axis = strip_axis(
-                    measured_geom,
+                strip = plan_strip(
+                    to_work_crs(geom, self.to_work),
                     None if self.to_work is not None else self.measure,
+                    bay_length=bay_length, bay_width=bay_width, orientation=orientation,
+                    min_bay_length=min_length, min_bay_width=min_width,
                 )
             except Exception as e:
-                dbg(f"strip_axis failed for fid={feature.id()}: {e!r}")
-            if axis is None:
+                dbg(f"plan_strip failed for fid={feature.id()}: {e!r}")
+            if strip is None:
                 self.plans.append((feature, None))
                 continue
-            cut_points, length, depth, fit = axis
             if self.fallback_direction is None:
+                cut_points = strip.cut_points
                 if self.from_work is not None:
                     try:
                         cut_points = [self.from_work.transform(p) for p in cut_points]
                     except Exception:
                         pass
                 self.fallback_direction = cut_points
-            self.plans.append((feature, plan_bays(
-                length, depth, bay_length=bay_length, bay_width=bay_width,
-                fit=fit, orientation=orientation,
-                min_bay_length=min_length, min_bay_width=min_width,
-            )))
+            self.plans.append((feature, strip.plan))
 
         self._render_summary()
 
@@ -1695,25 +1692,33 @@ class _SplitEngine:
     def _measure_strip(self, feature, geom):
         """Set this feature's cut direction and, in bay mode, plan its bays."""
         fid = feature.id()
-        axis = None
+        strip = None
         try:
             measure = None if self.to_work is not None else self.bay_settings.get("measure")
-            axis = strip_axis(geom, measure)
+            strip = plan_strip(
+                geom, measure,
+                bay_length=self.bay_settings.get("bay_length", DEFAULT_BAY_LENGTH),
+                bay_width=self.bay_settings.get("bay_width", DEFAULT_BAY_WIDTH),
+                orientation=self.bay_settings.get("orientation"),
+                min_bay_length=self.bay_settings.get("min_bay_length", DEFAULT_MIN_BAY_LENGTH),
+                min_bay_width=self.bay_settings.get("min_bay_width", DEFAULT_MIN_BAY_WIDTH),
+            )
         except Exception as e:
-            dbg(f"  fid={fid}: strip_axis raised {e!r}")
+            dbg(f"  fid={fid}: plan_strip raised {e!r}")
 
-        if axis is None:
+        if strip is None:
             self._record_fallback(
                 f"Feature {fid}: could not measure the strip; the drawn "
                 "direction was used instead."
             )
             return None
 
-        cut_points, length, depth, fit = axis
-        dbg(f"  fid={fid}: strip {length:.2f} x {depth:.2f} m, "
-            f"fit={fit if fit is None else round(fit, 3)}, "
-            f"cut direction {axis_angle_degrees(cut_points):.2f}deg")
-        if self.auto_direction and not self._use_strip_direction(cut_points):
+        shape = strip.shape
+        dbg(f"  fid={fid}: strip {shape.length:.2f} x {shape.depth:.2f} m, "
+            f"fit={shape.fit if shape.fit is None else round(shape.fit, 3)}, "
+            f"ends {shape.slant:.1f}deg from square, "
+            f"cut direction {axis_angle_degrees(strip.cut_points):.2f}deg")
+        if self.auto_direction and not self._use_strip_direction(strip.cut_points):
             self._record_fallback(
                 f"Feature {fid}: strip is too small to take a direction from."
             )
@@ -1721,17 +1726,7 @@ class _SplitEngine:
         if self.mode != "bays":
             return None
 
-        plan = plan_bays(
-            length, depth,
-            bay_length=self.bay_settings.get("bay_length", DEFAULT_BAY_LENGTH),
-            bay_width=self.bay_settings.get("bay_width", DEFAULT_BAY_WIDTH),
-            fit=fit,
-            orientation=self.bay_settings.get("orientation"),
-            min_bay_length=self.bay_settings.get(
-                "min_bay_length", DEFAULT_MIN_BAY_LENGTH),
-            min_bay_width=self.bay_settings.get(
-                "min_bay_width", DEFAULT_MIN_BAY_WIDTH),
-        )
+        plan = strip.plan
         self.bay_plans[fid] = plan
         dbg(f"  fid={fid}: {plan.describe()}")
         for warning in plan.warnings:

@@ -13,8 +13,17 @@ Once the spacing is known the number of bays is round(length / spacing) and the
 strip is divided into that many equal parts, so drawing slack of a few
 centimetres is spread out instead of left as a sliver at one end.
 
-plan_bays() is pure arithmetic and is unit-tested; strip_axis() is the only
-part that needs QGIS.
+Strips with slanted ends
+------------------------
+Where the two ends of a perpendicular strip are straight, parallel and slanted
+(a parallelogram), the bays are painted along those ends: every bay is the same
+parallelogram. The cuts then follow the ends instead of running square to the
+kerb, and the bay width that has to fit a car is measured square to the cuts.
+Ends that are slanted but not parallel cannot all be followed; such a strip is
+cut square to the kerb and the dialog says so.
+
+plan_bays() and end_slant() are pure arithmetic and are unit-tested;
+measure_strip() and plan_strip() are the parts that need QGIS.
 """
 
 import math
@@ -39,12 +48,17 @@ _DEPTH_TOLERANCE = 0.20         # relative; 2.5 m +/- 0.5, 5.0 m +/- 1.0
 _REMAINDER_WARNING = 0.15       # fraction of a bay left over before we complain
 _FIT_WARNING = 0.90             # polygon area / bounding box area
 
+_END_EDGE_MIN_ANGLE = 20.0      # degrees from the kerb before an edge counts as an end
+_END_COVERAGE = 0.80            # a straight end spans at least this much of the depth
+_SQUARE_SLANT = 2.0             # degrees; ends closer to square than this are square
+_PARALLEL_ENDS = 3.0            # degrees; ends this close to each other are parallel
+
 
 class BayPlan:
     """What to do with one strip, and what looks wrong about it."""
 
     __slots__ = ("orientation", "spacing", "count", "actual", "length",
-                 "depth", "fit", "warnings")
+                 "depth", "fit", "warnings", "slant", "bay_depth")
 
     def __init__(self, orientation, spacing, count, actual, length, depth, fit, warnings):
         self.orientation = orientation
@@ -55,6 +69,8 @@ class BayPlan:
         self.depth = depth
         self.fit = fit
         self.warnings = warnings
+        self.slant = 0.0            # degrees the cuts lean away from square to the kerb
+        self.bay_depth = depth      # length of a bay along its cuts
 
     @property
     def ok(self):
@@ -65,9 +81,11 @@ class BayPlan:
             return (f"{self.length:.1f} x {self.depth:.1f} {unit}: depth matches "
                     f"neither a bay width nor a bay length")
         kind = "parallel" if self.orientation == PARALLEL else "perpendicular"
-        across = self.depth
-        return (f"{self.length:.1f} x {self.depth:.1f} {unit} -> {self.count} "
-                f"{kind} bays of {self.actual:.2f} x {across:.2f} {unit}")
+        text = (f"{self.length:.1f} x {self.depth:.1f} {unit} -> {self.count} "
+                f"{kind} bays of {self.actual:.2f} x {self.bay_depth:.2f} {unit}")
+        if self.slant:
+            text += f", along the slanted ends ({abs(self.slant):.0f}°)"
+        return text
 
 
 def choose_count(length, spacing, minimum, maximum):
@@ -242,6 +260,55 @@ def min_width_axis(hull):
     return along, across, length, width, base
 
 
+def end_slant(hull, along, across, depth):
+    """How far the strip's ends lean away from square, if they agree.
+
+    hull          convex hull, counter-clockwise, as (x, y) tuples
+    along/across  unit vectors along the kerb and across the strip
+    depth         kerb-to-kerb width, in the hull's units
+
+    An end is the hull edge on that side of the strip that spans most of the
+    depth; it has to be straight (cover at least 80% of the depth) to count.
+    Returns (slant, note): slant in degrees, positive when the ends lean
+    towards `along`, or None when the ends are square, not straight, or not
+    parallel; note explains the last case for the dialog, else None.
+    """
+    if len(hull) < 3 or depth <= 0.0:
+        return None, None
+
+    centre = sum(x * along[0] + y * along[1] for x, y in hull) / len(hull)
+    min_cross = math.sin(math.radians(_END_EDGE_MIN_ANGLE))
+    ends = {}                                   # side -> (coverage, slant)
+    for i in range(len(hull)):
+        (ax, ay), (bx, by) = hull[i], hull[(i + 1) % len(hull)]
+        ex, ey = bx - ax, by - ay
+        size = math.hypot(ex, ey)
+        if size <= 0.0:
+            continue
+        a = (ex * along[0] + ey * along[1]) / size     # cosine with the kerb
+        c = (ex * across[0] + ey * across[1]) / size   # cosine with the cut
+        if abs(c) < min_cross:
+            continue                                   # a kerb edge
+        if c < 0:
+            a, c = -a, -c
+        slant = math.degrees(math.atan2(a, c))
+        coverage = size * c / depth
+        mid = ((ax + bx) / 2) * along[0] + ((ay + by) / 2) * along[1]
+        side = "low" if mid < centre else "high"
+        if side not in ends or coverage > ends[side][0]:
+            ends[side] = (coverage, slant)
+
+    if len(ends) < 2 or min(cov for cov, _ in ends.values()) < _END_COVERAGE:
+        return None, None                              # rounded or ragged ends
+    low, high = ends["low"][1], ends["high"][1]
+    if abs(low) < _SQUARE_SLANT and abs(high) < _SQUARE_SLANT:
+        return None, None                              # square ends
+    if abs(low - high) > _PARALLEL_ENDS:
+        return None, (f"The ends are not parallel ({abs(low):.0f}° and {abs(high):.0f}° "
+                      "from square), so the bays are cut square to the kerb.")
+    return (low + high) / 2.0, None
+
+
 # ---------------------------------------------------------------------------
 # QGIS-facing part
 # ---------------------------------------------------------------------------
@@ -249,27 +316,34 @@ def min_width_axis(hull):
 from qgis.core import QgsPointXY  # noqa: E402
 
 
-def strip_axis(geom, measure=None):
-    """Measure a strip and give the direction its bays should be cut in.
+class StripShape:
+    """A measured strip: its size, and the directions it can be cut in."""
 
-    Returns (cut_points, length, depth, fit):
+    __slots__ = ("square_cut_points", "end_cut_points", "length", "depth",
+                 "fit", "end_fit", "slant", "ends_note")
 
-      cut_points  a pair of QgsPointXY along the direction of the cuts, which
-                  is across the strip
-      length      usable length along the strip, in metres: its area divided
-                  by its depth, so the length along the middle of the strip.
-                  Slanted ends do not add bays this way; the full extent would
-                  count the overhang and squeeze the bays in between.
-      depth       size across the strip, in metres
-      fit         polygon area over bounding rectangle area; well below 1 means
-                  slanted ends, a curve or a ragged outline
+    def __init__(self, square_cut_points, length, depth, fit,
+                 end_cut_points=None, end_fit=None, slant=0.0, ends_note=None):
+        self.square_cut_points = square_cut_points   # cuts square to the kerb
+        self.end_cut_points = end_cut_points         # cuts along slanted ends, or None
+        self.length = length          # usable length along the kerb, metres (area / depth)
+        self.depth = depth            # kerb to kerb, metres
+        self.fit = fit                # area / bounding rectangle
+        self.end_fit = end_fit        # area / bounding parallelogram, for slanted ends
+        self.slant = slant            # degrees the ends lean away from square
+        self.ends_note = ends_note    # why slanted ends could not be followed
 
-    The axis comes from the polygon's own convex hull rather than from
-    QgsGeometry.orientedMinimumBoundingBox(), so the behaviour is the same
-    everywhere and can be tested outside QGIS.  `measure` converts a pair of
+
+def measure_strip(geom, measure=None):
+    """Measure a strip; see StripShape. Returns None if it cannot be measured.
+
+    The kerb axis is the direction in which the strip is narrowest, found on
+    its convex hull, so the behaviour does not depend on QGIS's bounding-box
+    routines and can be tested without QGIS. `measure` converts a pair of
     points to metres; without it coordinates are taken as metres.
 
-    Returns None if the shape cannot be measured.
+    The usable length is the area divided by the depth, so the length along
+    the middle of the strip: slanted ends do not add bays this way.
     """
     try:
         vertices = _vertices_of(geom)
@@ -278,7 +352,8 @@ def strip_axis(geom, measure=None):
     if len(vertices) < 3:
         return None
 
-    axis = min_width_axis(convex_hull(vertices))
+    hull = convex_hull(vertices)
+    axis = min_width_axis(hull)
     if axis is None:
         return None
     along, across, length_units, depth_units, base = axis
@@ -286,7 +361,7 @@ def strip_axis(geom, measure=None):
         return None
 
     bx, by = base
-    cut_points = [
+    square_cut_points = [
         QgsPointXY(bx, by),
         QgsPointXY(bx + across[0] * depth_units, by + across[1] * depth_units),
     ]
@@ -302,17 +377,86 @@ def strip_axis(geom, measure=None):
         length, depth = usable_units, depth_units
     else:
         try:
-            # metres per coordinate unit, along and across the strip
             full = measure(
                 QgsPointXY(bx, by),
                 QgsPointXY(bx + along[0] * length_units, by + along[1] * length_units),
             )
             length = usable_units * full / length_units
-            depth = measure(cut_points[0], cut_points[1])
+            depth = measure(square_cut_points[0], square_cut_points[1])
         except Exception:
             length, depth = usable_units, depth_units
 
-    return cut_points, length, depth, fit
+    shape = StripShape(square_cut_points, length, depth, fit)
+
+    slant, note = end_slant(hull, along, across, depth_units)
+    shape.ends_note = note
+    if slant is not None:
+        rad = math.radians(slant)
+        dx = across[0] * math.cos(rad) + along[0] * math.sin(rad)
+        dy = across[1] * math.cos(rad) + along[1] * math.sin(rad)
+        reach = depth_units / math.cos(rad)
+        shape.end_cut_points = [QgsPointXY(bx, by), QgsPointXY(bx + dx * reach, by + dy * reach)]
+        shape.slant = slant
+        # bounding parallelogram: extent square to the cuts times the cut length
+        nx, ny = -dy, dx
+        spread = [x * nx + y * ny for x, y in hull]
+        if area_units > 0.0:
+            shape.end_fit = area_units / ((max(spread) - min(spread)) * reach)
+    return shape
+
+
+class StripPlan:
+    """How one strip is to be cut: the bay plan and the cut direction."""
+
+    __slots__ = ("shape", "plan", "cut_points")
+
+    def __init__(self, shape, plan, cut_points):
+        self.shape = shape
+        self.plan = plan
+        self.cut_points = cut_points
+
+
+def plan_strip(geom, measure=None, **settings):
+    """Measure a strip and plan its bays. Returns StripPlan, or None.
+
+    `settings` are passed to plan_bays(): bay_length, bay_width, orientation,
+    min_bay_length, min_bay_width.
+
+    Perpendicular bays follow slanted ends when the ends are parallel. Each bay
+    is then a parallelogram; the width that has to fit a car is the distance
+    between two cuts, so the strip's length is taken square to the cuts.
+    """
+    shape = measure_strip(geom, measure)
+    if shape is None:
+        return None
+
+    plan = plan_bays(shape.length, shape.depth, fit=shape.fit, **settings)
+    if plan.orientation != PERPENDICULAR:
+        return StripPlan(shape, plan, shape.square_cut_points)
+
+    if shape.end_cut_points is None:
+        if shape.ends_note:
+            plan.warnings.append(shape.ends_note)
+        return StripPlan(shape, plan, shape.square_cut_points)
+
+    cos_slant = math.cos(math.radians(shape.slant))
+    forced = dict(settings, orientation=PERPENDICULAR)
+    slanted = plan_bays(shape.length * cos_slant, shape.depth, fit=shape.end_fit, **forced)
+    slanted.slant = shape.slant
+    slanted.bay_depth = shape.depth / cos_slant
+    slanted.length = shape.length      # report the kerb length, as for any strip
+    return StripPlan(shape, slanted, shape.end_cut_points)
+
+
+def strip_axis(geom, measure=None):
+    """(square_cut_points, length, depth, fit) of a strip, or None.
+
+    Kept for callers that only need the kerb axis; see measure_strip().
+    """
+    shape = measure_strip(geom, measure)
+    if shape is None:
+        return None
+    return shape.square_cut_points, shape.length, shape.depth, shape.fit
 
 
 def axis_angle_degrees(cut_points):

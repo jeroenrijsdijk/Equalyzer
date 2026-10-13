@@ -1,20 +1,21 @@
 # Equalyzer
 
 A QGIS plugin that splits polygons into equal parts, into parts of a given
-area, or into parking bays. It should work in QGIS 3.16 and later and in QGIS 4,
+area, or into parking bays. It works in QGIS 3.16 and later and in QGIS 4,
 and in projected as well as geographic coordinate systems.
 
 ![Three parking strips divided by Equalyzer](docs/parking-bays.png)
 
 *Three strips as Equalyzer divides them. The orientation and the number of
-bays come from the strips themselves; slanted ends stay with the outer
-bays.*
+bays come from the strips themselves; where the ends of a strip are
+slanted, the bays follow them.*
 
 ## Features
 
 - **Parking bays in one click.** Select one strip or many, or draw a line
   over a single strip. Equalyzer works out whether it holds perpendicular or
-  parallel bays and how many, then cuts it square across its own axis.
+  parallel bays and how many, then cuts it across its own axis, following
+  slanted ends where the strip has them.
 - **Exactly equal parts.** Cut positions are solved in closed form from the
   polygon's area profile, so parts are equal to within rounding, not
   approximately.
@@ -54,6 +55,10 @@ and go into `python/plugins`:
 
 Restart QGIS and tick Equalyzer under *Plugins ▸ Manage and Install
 Plugins ▸ Installed*.
+
+QGIS 3 and QGIS 4 keep their plugins in separate profile folders. If you use
+both, install Equalyzer in each; otherwise one of them keeps running an older
+copy, recognisable by a missing *Split into Parking Bays* button.
 
 The three actions appear on the *Equalyzer* toolbar and under *Plugins ▸
 Equalyzer*.
@@ -102,6 +107,32 @@ centimetres of drawing slack are spread over all bays instead of left as a
 sliver at one end. The length is measured along the middle of the strip
 (area ÷ depth), so slanted ends do not squeeze in an extra bay.
 
+### Strips with slanted ends
+
+![A parallelogram strip divided into seven slanted bays](docs/slanted-ends.png)
+
+A perpendicular strip whose two ends are straight, parallel and slanted, a
+parallelogram, is divided the way such strips are painted: every bay is the
+same parallelogram, with its dividers parallel to the ends.
+
+The width that has to fit a car is the distance between two dividers,
+measured square to them, not the stretch of kerb a bay takes up. The bays
+are therefore counted on the strip's length square to the ends. A strip
+with 20 m of kerb, 5 m deep and ends 30° from square is 20 × cos 30° =
+17.32 m across the dividers: 7 bays of 2.47 m, each 5.77 m long along the
+divider. Counted along the kerb it would have been 8 bays, only 2.17 m
+wide between the dividers.
+
+- Ends that are slanted but not parallel cannot both be followed; such a
+  strip is cut square to the kerb and the dialog says so.
+- Parallel bays (langsparkeren) are always cut square to the kerb; the
+  slanted ends stay with the first and last bay.
+- Rounded or ragged ends are not followed; an end counts as straight when
+  one edge spans at least 80 % of the depth.
+- Angled parking (schuinparkeren) drawn as a parallelogram is handled the
+  same way. Below 4 m of kerb-to-kerb depth the dialog cannot tell it from
+  parallel parking; set *Orientation* to perpendicular for those strips.
+
 ### The dialog
 
 | Field | Default | Meaning |
@@ -114,13 +145,17 @@ sliver at one end. The length is measured along the middle of the strip
 | What to do with the result | Collect in Split Parts | or replace the strip in its own layer |
 
 Below the fields the dialog lists the plan per strip, such as
-`17.86 x 2.40 m -> 3 parallel bays of 5.95 x 2.40 m`, and flags:
+`17.86 x 2.40 m -> 3 parallel bays of 5.95 x 2.40 m` or
+`20.0 x 5.0 m -> 7 perpendicular bays of 2.47 x 5.77 m, along the slanted
+ends (30°)`, and flags:
 
 - bays that come out more than 15 % off the nominal size, or a length for
   which no number of bays respects the minimum;
 - a depth that fits neither bay size;
-- a strip that fills less than 90 % of its bounding rectangle, which means
-  slanted ends, a curve or a ragged outline.
+- slanted ends that are not parallel;
+- a strip that fills less than 90 % of its bounding rectangle (or, with
+  slanted ends that are followed, of its bounding parallelogram), which
+  means a curve or a ragged outline.
 
 All values are remembered between sessions.
 
@@ -237,7 +272,9 @@ usually avoids it.
 For parking strips the axis is the direction in which the strip is
 narrowest, found on its convex hull. The minimum-width strip around a
 convex shape always lies flush with one of its edges, so trying every hull
-edge is enough; for a parking strip that edge is the kerb.
+edge is enough; for a parking strip that edge is the kerb. The ends are the
+hull edges on either side that span most of the depth; when both are
+straight and within 3° of each other, the cuts follow them.
 
 ## Settings
 
@@ -254,8 +291,8 @@ Stored with QGIS's own settings, under `Equalyzer/`:
 
 ## Known limitations
 
-- Angled parking (schuinparkeren) is not recognised: such a strip is
-  treated as perpendicular and cut every 2.5 m along the kerb.
+- Angled parking in a strip that is not a parallelogram, for instance with
+  square ends, is not recognised: it is cut square to the kerb every 2.5 m.
 - A curved strip has no straight axis. The dialog warns about strips that
   fill less than 90 % of their bounding rectangle; split a curved strip
   into straight pieces first.
@@ -336,7 +373,8 @@ Equalyzer is een QGIS-plugin die vlakken in gelijke delen knipt, en
 parkeerstroken in losse parkeervakken. Selecteer een strook of trek er een
 lijn overheen, druk op *Split into Parking Bays*: de plugin ziet aan de
 diepte of het om haaks- of langsparkeren gaat, bepaalt het aantal vakken
-met een minimummaat (standaard 4,80 × 2,40 m) en knipt haaks op de strook.
+met een minimummaat (standaard 4,80 × 2,40 m) en knipt haaks op de strook,
+of langs de schuine kopse kanten als de strook een parallellogram is.
 De vakken nemen alle attributen van de strook over en kunnen de strook in de
 eigen laag vervangen, als één stap die je met Ctrl+Z terugdraait. Werkt in
 RD, in WGS84 en in Web Mercator.

@@ -3,7 +3,7 @@ name=Equalyzer
 qgisMinimumVersion=3.16
 qgisMaximumVersion=4.99
 description=Split polygons into equal parts, equal areas, or parking bays
-version=2.0.1
+version=2.1.0
 author=Jay (original plugin by Abel Koszeghy)
 email=jri@rvmk.nl
 
@@ -21,7 +21,12 @@ deprecated=False
 category=Vector
 server=False
 
-changelog=2.0.1
+changelog=2.1.0
+  - Perpendicular strips shaped as a parallelogram are divided the way they are painted: every bay is the same parallelogram, with its dividers along the slanted ends. The bays are counted on the distance between dividers, the width a car needs (a 20 m strip with ends 30 degrees from square gives 7 bays of 2.47 m, 5.77 m long). Ends that are slanted but not parallel are cut square to the kerb and flagged in the dialog; parallel bays stay square to the kerb. Angled parking drawn as a parallelogram works the same way.
+  - The dialog line for such a strip names the slant, e.g. "7 perpendicular bays of 2.47 x 5.77 m, along the slanted ends (30 deg)".
+  - The bay dialog and the engine now share one planning function (parking.plan_strip).
+  - Tests: 60.
+  2.0.1
   Review fixes before publication. README completed for GitHub.
   - Equal parts on a layer in degrees: the drawn direction was applied in the metric work frame without converting it, so cuts came out several degrees off the line.
   - Web Mercator and CRSs in feet are now recognised as not being ground metres (a length check against the ellipsoid) and handled like degrees; before, a 5 m deep strip in EPSG:3857 measured 8.1 m and was not divided, and areas were 2.6 times too large.
