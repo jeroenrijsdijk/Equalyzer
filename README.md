@@ -1,7 +1,7 @@
 # Equalyzer
 
 A QGIS plugin that splits polygons into equal parts, into parts of a given
-area, or into parking bays. It works in QGIS 3.16 and later and in QGIS 4,
+area, or into parking bays. It should work in QGIS 3.16 and later and in QGIS 4,
 and in projected as well as geographic coordinate systems.
 
 ![Three parking strips divided by Equalyzer](docs/parking-bays.png)
