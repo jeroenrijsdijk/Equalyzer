@@ -6,6 +6,8 @@ and in projected as well as geographic coordinate systems.
 
 ![Three parking strips divided by Equalyzer](docs/parking-bays.png)
 
+![Slanted Ends](docs/slanted-ends.png)
+
 *Three strips as Equalyzer divides them. The orientation and the number of
 bays come from the strips themselves; where the ends of a strip are
 slanted, the bays follow them.*
